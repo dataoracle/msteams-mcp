@@ -17,12 +17,12 @@ This skill uses the bare names.
 
 | Tool | Use for |
 |---|---|
-| `list_chats(query?, limit?)` | Finding a chat_id; catching up (`unread` flag, last message preview) |
+| `list_chats(query?, limit?)` | Finding a chat id; catching up (UNREAD flag, last message) |
 | `read_chat_messages(chat_id, limit?, since?)` | Reading a conversation (oldest first) |
-| `get_chat_message(chat_id, message_id)` | One message in full, when a list entry says `truncated` |
-| `get_chat(chat_id)` | Members and roles, meeting link of a meeting chat |
+| `get_chat_message(chat_id, message_id)` | One message in full, when a transcript line ends with `[truncated] [id N]` |
+| `get_chat(chat_id)` | Members with emails and roles, meeting link of a meeting chat |
 | `search_messages(query)` | "Where did someone mention X?": keyword search across chats and channels |
-| `find_people(query)` | Resolving a name to an email/user_id |
+| `find_people(query)` | Resolving a name to an email |
 | `list_teams` → `list_channels(team_id)` → `read_channel_messages(...)` | Channel conversations |
 | `get_channel_thread(team_id, channel_id, message_id)` | A whole channel thread |
 | `list_team_members(team_id)` | Who is in a team |
@@ -38,15 +38,15 @@ This skill uses the bare names.
      It matches chat titles and member names. A 1:1 chat is named after the
      other person.
    - With a topic or keyword ("the invoice thread"), call `search_messages`
-     instead, then read around a hit with `read_chat_messages` (via `chat_id`)
-     or `get_channel_thread` (via `team_id`/`channel_id`/`message_id`).
+     instead, then read around a hit with `read_chat_messages` (its `chat`
+     id) or `get_channel_thread` (its `team`, `channel` and `msg` ids).
    - Several chats match: show the candidates (name, members, last activity)
      and ask which one. Don't guess.
 2. **Read only what the question needs.** The default `limit` (30) is usually
    enough. For "what happened since yesterday", pass `since` (ISO 8601 with
    offset) rather than a big limit.
 3. **Catch-up requests** ("anything I missed?"): call `list_chats()`, focus on
-   `unread: true`, and read those chats with a small limit. Summarise per chat.
+   the chats marked UNREAD, and read those with a small limit. Summarise per chat.
 
 ### Sending (only if the write tools are present)
 
@@ -62,7 +62,7 @@ send, reply, or meeting creation:
    channel) and the exact text, then **wait for explicit confirmation**. A
    general instruction earlier in the conversation isn't confirmation for a
    specific message, unless the user said to send without asking.
-3. Send once. Report the result (`sent: true`, time). Never claim a message
+3. Send once. Report the result line ("Sent to … at …"). Never claim a message
    was sent if the tool returned an error.
 
 Formatting: use `format="text"` for normal messages (line breaks are kept).
@@ -74,16 +74,42 @@ put anything in a calendar. Offer to post the link in a chat.
 
 ## Reading the data
 
-- Message `text` is converted from Teams HTML: `[image]` and `[attachment]`
-  mark inline content. `attachments` lists files (name, SharePoint URL) and
-  quoted replies (`quoted_from`, `quoted_preview`).
-- `from: null` with a `type`/`event` field is a system event (member added,
-  call ended...). These are hidden by default (`include_system=false`).
-- `deleted` means the message was deleted; its text is empty.
-- Times are UTC (`Z`). Convert them to the user's timezone when you answer if
-  you know it.
-- A `note` field means more data exists than was returned. Mention it if it
-  matters.
+Read tools return compact text. A chat reads as a transcript:
+
+```
+30 messages, oldest first (times UTC)
+2026-11-13
+10:01 Alice Johnson: first message [file: Q4.xlsx] 👍2
+      second message from Alice, sent within 5 minutes
+10:20 Bob Smith: ↪ Alice Johnson: "first message"
+      reply text (edited)
+10:31 Carol Diaz: a very long message cut off here… [truncated] [id 1731492660000]
+(older messages exist beyond these 30: raise limit or use since)
+```
+
+- **Lines.** A date line starts each day. An indented line without a time
+  continues the previous sender's message, or is a further message from them
+  sent within 5 minutes.
+- **Markers:**
+  - `↪ Name: "…"` is a quoted reply.
+  - `[file: name]` is an attachment and `[card]` is an adaptive card; their links
+    appear only in the full-message tools.
+  - `👍2` are reactions, and `!high` / `!urgent` the importance.
+  - `(edited)` and `(deleted)` mean what they say.
+  - `[image]` marks an inline image.
+- **Ids are shown only where you need them:**
+  - chat lists end with `id <chat id>`;
+  - channel posts end with `[post <id>]`, which you use to reply or to open the thread;
+  - truncated messages end with `[truncated] [id N]`: call `get_chat_message` with that id;
+  - in channels, `get_channel_thread` gives the full text.
+- `system: (membersAdded)` and similar lines are system events. They are hidden
+  unless `include_system=true`.
+- **Times** are UTC. Convert them to the user's timezone when you answer, if you
+  know it.
+- **Notes.** A last line in parentheses means more data exists than was
+  returned. Mention it if it matters.
+- **Structured data.** `output="json"` returns the same data as JSON. Use it
+  only if you need exact fields, since it costs more tokens.
 
 ## Errors
 

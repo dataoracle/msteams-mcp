@@ -1,4 +1,11 @@
-"""Turn Graph chat/channel objects into compact, readable dicts for the model."""
+"""Turn Graph chat/channel objects into compact output for the model.
+
+Two layers:
+- normalisers (message, chat, person, member, ...) turn Graph JSON into small
+  dicts, keeping only what is useful; these are also the format="json" output;
+- renderers (render_*) turn those dicts into a compact, transcript-style text,
+  the default output. Ids and URLs only appear where a follow-up call needs them.
+"""
 from __future__ import annotations
 
 import json
@@ -25,9 +32,8 @@ class _TextExtractor(HTMLParser):
             self.out.append(f"[{a.get('alt') or 'image'}]")
         elif tag == "emoji":
             self.out.append(a.get("alt") or "")
-        elif tag == "attachment":
-            self.out.append("[attachment]")
         elif tag in _BLOCK:
+            # <attachment> placeholders are dropped: attachments are listed separately.
             self.out.append("\n")
 
     def handle_endtag(self, tag):
@@ -44,7 +50,7 @@ def html_to_text(content: str) -> str:
     p.close()
     text = "".join(p.out).replace("\u00a0", " ")
     text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)  # paragraph breaks -> single line breaks
     return text.strip()
 
 
@@ -67,6 +73,24 @@ def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _t(value: str | None) -> datetime | None:
+    try:
+        return parse_time(value).astimezone(timezone.utc) if value else None
+    except ValueError:
+        return None
+
+
+def short_time(value: str | None) -> str:
+    """'2026-11-13T10:03:21.1234567Z' -> '2026-11-13 10:03' (UTC)."""
+    t = _t(value)
+    return t.strftime("%Y-%m-%d %H:%M") if t else (value or "?")
+
+
+def _shorten(text: str, n: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
 def who(identity: dict | None) -> str | None:
     """Display name from a Graph identitySet (user, application or device)."""
     if not identity:
@@ -78,62 +102,77 @@ def who(identity: dict | None) -> str | None:
     return None
 
 
-def _attachment(a: dict) -> dict:
-    ct = a.get("contentType") or ""
-    if ct == "messageReference":  # a quoted reply
-        try:
-            ref = json.loads(a.get("content") or "{}")
-        except ValueError:
-            ref = {}
-        return {"quoted_message_id": ref.get("messageId") or a.get("id"),
-                "quoted_from": who(ref.get("messageSender")),
-                "quoted_preview": (ref.get("messagePreview") or "")[:300]}
-    if ct.startswith("application/vnd.microsoft.card"):
-        return {"type": "card", "card_type": ct.rsplit(".", 1)[-1], "name": a.get("name")}
-    return {"name": a.get("name"), "type": ct or None, "url": a.get("contentUrl")}
+# ---------------------------------------------------------------- normalisers
+_REACTIONS = {"like": "👍", "heart": "❤️", "laugh": "😆", "surprised": "😮", "sad": "😢", "angry": "😡"}
 
 
-def message(m: dict, max_chars: int | None = None) -> dict:
+def _reaction(r: dict) -> str:
+    kind = r.get("reactionType") or ""
+    if kind in _REACTIONS:
+        return _REACTIONS[kind]
+    if kind and not kind.isascii():  # newer API: reactionType is the emoji itself
+        return kind
+    return r.get("displayName") or kind or "?"
+
+
+def message(m: dict, max_chars: int | None = None, full: bool = False) -> dict:
+    """Normalise a chatMessage. full=True (single-item tools) keeps URLs,
+    timestamps of edits, the replied-to id and longer quote previews."""
     body = m.get("body") or {}
     content = body.get("content") or ""
     text = html_to_text(content) if (body.get("contentType") or "").lower() == "html" else content.strip()
-    out: dict = {
-        "message_id": m.get("id"),
-        "created": m.get("createdDateTime"),
-        "from": who(m.get("from")),
-        "text": text,
-    }
+    out: dict = {"message_id": m.get("id"), "created": m.get("createdDateTime"),
+                 "from": who(m.get("from")), "text": text}
     if max_chars and len(text) > max_chars:
-        out["text"] = text[:max_chars] + " […]"
+        out["text"] = text[:max_chars].rstrip() + "…"
         out["truncated"] = True
     mtype = m.get("messageType")
     if mtype and mtype != "message":
         out["type"] = mtype
         event = (m.get("eventDetail") or {}).get("@odata.type")
         if event:
-            out["event"] = event.rsplit(".", 1)[-1]
+            out["event"] = event.rsplit(".", 1)[-1].removesuffix("EventMessageDetail")
     if m.get("subject"):
         out["subject"] = m["subject"]
     if m.get("importance") not in (None, "normal"):
         out["importance"] = m["importance"]
-    if m.get("replyToId"):
+    if full and m.get("replyToId"):
         out["reply_to_id"] = m["replyToId"]
     if m.get("lastEditedDateTime"):
-        out["edited"] = m["lastEditedDateTime"]
+        out["edited"] = m["lastEditedDateTime"] if full else True
     if m.get("deletedDateTime"):
-        out["deleted"] = m["deletedDateTime"]
+        out["deleted"] = True
         out["text"] = ""
-    atts = [_attachment(a) for a in m.get("attachments") or []]
-    if atts:
-        out["attachments"] = atts
-    mentions = sorted({x.get("mentionText") for x in m.get("mentions") or [] if x.get("mentionText")})
-    if mentions:
-        out["mentions"] = mentions
-    reactions = Counter((r.get("displayName") or r.get("reactionType") or "?")
-                        for r in m.get("reactions") or [])
+    files, cards, quoted = [], [], []
+    for a in m.get("attachments") or []:
+        ct = a.get("contentType") or ""
+        if ct == "messageReference":  # a quoted reply
+            try:
+                ref = json.loads(a.get("content") or "{}")
+            except ValueError:
+                ref = {}
+            q = {"from": who(ref.get("messageSender")),
+                 "preview": _shorten(ref.get("messagePreview") or "", 300 if full else 60)}
+            if full:
+                q["message_id"] = ref.get("messageId") or a.get("id")
+            quoted.append(q)
+        elif ct.startswith("application/vnd.microsoft.card"):
+            cards.append(ct.rsplit(".", 1)[-1])
+        else:
+            f = {"name": a.get("name") or ct or "file"}
+            if full and a.get("contentUrl"):
+                f["url"] = a["contentUrl"]
+            files.append(f)
+    if quoted:
+        out["quoted"] = quoted
+    if files:
+        out["files"] = files
+    if cards:
+        out["cards"] = cards
+    reactions = Counter(_reaction(r) for r in m.get("reactions") or [])
     if reactions:
-        out["reactions"] = dict(reactions)
-    if m.get("webUrl"):
+        out["reactions"] = " ".join(f"{e}{n}" for e, n in reactions.items())
+    if full and m.get("webUrl"):
         out["web_url"] = m["webUrl"]
     return out
 
@@ -142,8 +181,6 @@ def person(u: dict) -> dict:
     return {k: v for k, v in {
         "name": u.get("displayName"),
         "email": u.get("mail") or u.get("userPrincipalName"),
-        "upn": u.get("userPrincipalName"),
-        "user_id": u.get("id"),
         "job_title": u.get("jobTitle"),
         "department": u.get("department"),
         "office": u.get("officeLocation"),
@@ -151,21 +188,30 @@ def person(u: dict) -> dict:
 
 
 def member(m: dict) -> dict:
+    roles = [r for r in m.get("roles") or [] if r]
     return {k: v for k, v in {
         "name": m.get("displayName"),
         "email": m.get("email"),
-        "user_id": m.get("userId"),
-        "roles": m.get("roles") or None,
+        "roles": ",".join(roles) or None,
     }.items() if v}
 
 
-def chat(c: dict, me_id: str | None, preview_chars: int = 200) -> dict:
+def _names(names: list[str], cap: int = 5) -> str:
+    return ", ".join(names[:cap]) + (f" +{len(names) - cap}" if len(names) > cap else "")
+
+
+CHAT_TYPES = {"oneOnOne": "1:1", "group": "group", "meeting": "meeting"}
+
+
+def chat(c: dict, me_id: str | None, preview_chars: int = 80, full: bool = False) -> dict:
     others = [m.get("displayName") for m in c.get("members") or []
               if m.get("userId") != me_id and m.get("displayName")]
-    name = c.get("topic") or ", ".join(others) or "(untitled chat)"
-    out: dict = {"chat_id": c.get("id"), "name": name, "type": c.get("chatType")}
-    if others:
-        out["members"] = others if len(others) <= 12 else others[:12] + [f"+{len(others) - 12} more"]
+    ctype = CHAT_TYPES.get(c.get("chatType") or "", c.get("chatType"))
+    name = c.get("topic") or (_names(others) if others else "(untitled chat)")
+    out: dict = {"chat_id": c.get("id"), "name": name, "type": ctype}
+    # Members only add information for titled group chats (otherwise the name is the members).
+    if others and c.get("topic") and ctype != "1:1":
+        out["members"] = _names(others)
     prev = c.get("lastMessagePreview") or {}
     if prev:
         body = prev.get("body") or {}
@@ -174,15 +220,141 @@ def chat(c: dict, me_id: str | None, preview_chars: int = 200) -> dict:
             text = html_to_text(text)
         out["last_message_at"] = prev.get("createdDateTime")
         out["last_message_from"] = who(prev.get("from"))
-        out["last_message_preview"] = text[:preview_chars] + ("…" if len(text) > preview_chars else "")
+        out["last_message_preview"] = _shorten(text, preview_chars)
         read_at = (c.get("viewpoint") or {}).get("lastMessageReadDateTime")
-        if read_at and prev.get("createdDateTime"):
-            try:
-                out["unread"] = parse_time(prev["createdDateTime"]) > parse_time(read_at)
-            except ValueError:
-                pass
+        t_prev, t_read = _t(prev.get("createdDateTime")), _t(read_at)
+        if t_prev and t_read:
+            out["unread"] = t_prev > t_read
     else:
         out["last_updated"] = c.get("lastUpdatedDateTime")
-    if c.get("webUrl"):
+    if full and c.get("webUrl"):
         out["web_url"] = c["webUrl"]
     return out
+
+
+# ---------------------------------------------------------------- renderers
+_PAD = "      "  # width of "HH:MM " so continuation lines align
+
+
+def _message_body(d: dict, show_id: bool) -> str:
+    if d.get("type"):
+        text = f"({d.get('event') or d['type']})"
+    else:
+        text = d.get("text") or ""
+    lines = [f'↪ {q.get("from") or "?"}: "{q.get("preview", "")}"' for q in d.get("quoted", [])]
+    if d.get("subject"):
+        lines.append(f"Subject: {d['subject']}")
+    tail = []
+    for f in d.get("files", []):
+        tail.append(f"[file: {f['name']}{' ' + f['url'] if f.get('url') else ''}]")
+    tail += ["[card]"] * len(d.get("cards", []))
+    if d.get("reactions"):
+        tail.append(d["reactions"])
+    if d.get("importance"):
+        tail.append(f"!{d['importance']}")
+    if d.get("edited"):
+        tail.append("(edited)")
+    if d.get("deleted"):
+        tail.append("(deleted)")
+    if d.get("truncated"):
+        tail.append("[truncated]")
+    if show_id:
+        tail.append(f"[id {d.get('message_id')}]")
+    lines.append(" ".join(x for x in (text, " ".join(tail)) if x))
+    return "\n".join(lines)
+
+
+def render_messages(msgs: list[dict], ids: str = "truncated", pad: str = "",
+                    day_headers: bool = True) -> str:
+    """Transcript: a date line per day, 'HH:MM Sender: text' per message.
+    Consecutive messages from one sender within 5 minutes are grouped.
+    ids: 'truncated' (only where get_chat_message is useful), 'all' or 'none'."""
+    lines: list[str] = []
+    day = last_from = last_t = None
+    for d in msgs:
+        t = _t(d.get("created"))
+        d_day = t.strftime("%Y-%m-%d") if t else "?"
+        if day_headers and d_day != day:
+            lines.append(f"{pad}{d_day}")
+            last_from = None
+        day = d_day
+        sender = d.get("from") or "system"
+        show_id = ids == "all" or (ids == "truncated" and d.get("truncated"))
+        body = _message_body(d, bool(show_id)).replace("\n", "\n" + pad + _PAD)
+        hm = t.strftime("%H:%M") if t else "--:--"
+        if not day_headers:
+            hm = t.strftime("%m-%d %H:%M") if t else hm
+        grouped = (sender == last_from and t and last_t and 0 <= (t - last_t).total_seconds() <= 300)
+        if grouped:
+            lines.append(f"{pad}{_PAD}{body}")
+        else:
+            lines.append(f"{pad}{hm} {sender}: {body}")
+        last_from, last_t = sender, t
+    return "\n".join(lines)
+
+
+def render_threads(threads: list[dict]) -> str:
+    """Channel posts (with [post id] for replying) and their replies, indented."""
+    lines: list[str] = []
+    day = None
+    for p in threads:
+        t = _t(p.get("created"))
+        d_day = t.strftime("%Y-%m-%d") if t else "?"
+        if d_day != day:
+            lines.append(d_day)
+            day = d_day
+        hm = t.strftime("%H:%M") if t else "--:--"
+        body = _message_body(p, show_id=False).replace("\n", "\n" + _PAD)
+        count = p.get("reply_count")
+        extra = (f" ({count} {'reply' if count == 1 else 'replies'}"
+                 f"{', latest 20 shown' if count > 20 and len(p.get('replies') or []) < count else ''})"
+                 if count else "")
+        lines.append(f"{hm} {p.get('from') or 'system'}: {body} [post {p.get('message_id')}]{extra}")
+        if p.get("replies"):
+            lines.append(render_messages(p["replies"], ids="none", pad="    ", day_headers=False))
+    return "\n".join(lines)
+
+
+def render_chats(chats: list[dict]) -> str:
+    lines = []
+    for c in chats:
+        parts = [f"• {c['name']} ({c.get('type')})"]
+        if c.get("members"):
+            parts.append(f"members: {c['members']}")
+        if c.get("last_message_at"):
+            parts.append(f"{short_time(c['last_message_at'])} {c.get('last_message_from') or '?'}: "
+                         f"{c.get('last_message_preview', '')}")
+        elif c.get("last_updated"):
+            parts.append(f"updated {short_time(c['last_updated'])}")
+        if c.get("unread"):
+            parts.append("UNREAD")
+        parts.append(f"id {c['chat_id']}")
+        lines.append(" · ".join(parts))
+    return "\n".join(lines)
+
+
+def render_people(people: list[dict]) -> str:
+    return "\n".join(
+        "• " + " · ".join(x for x in (f"{p.get('name')} <{p.get('email', '?')}>", p.get("job_title"),
+                                     p.get("department"), p.get("office")) if x)
+        for p in people) or "No matches."
+
+
+def render_members(members: list[dict]) -> str:
+    return "\n".join(
+        f"• {m.get('name')}{' <' + m['email'] + '>' if m.get('email') else ''}"
+        f"{' (' + m['roles'] + ')' if m.get('roles') else ''}" for m in members)
+
+
+def render_hits(hits: list[dict]) -> str:
+    lines = []
+    for h in hits:
+        where = (f"chat {h['chat_id']}" if h.get("chat_id") else
+                 f"team {h.get('team_id')} channel {h.get('channel_id')}" if h.get("channel_id") else "")
+        lines.append(f"• {short_time(h.get('created'))} {h.get('from') or '?'}: {h.get('summary', '')}"
+                     f" · {where} msg {h.get('message_id')}".rstrip())
+    return "\n".join(lines) or "No matches."
+
+
+def with_header(header: str, body: str, note: str | None = None) -> str:
+    return "\n".join(x for x in (header, body, f"({note})" if note else None) if x)
