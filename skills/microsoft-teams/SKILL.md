@@ -90,6 +90,9 @@ put anything in a calendar. Offer to post the link in a chat.
 - "Not signed in" / "sign-in is no longer valid … msteams-mcp-authorize": the
   server's Microsoft sign-in needs renewing. Tell the user to run
   `sudo msteams-mcp-authorize` on the server, then stop. Retrying won't help.
+- "rejected the app's client secret": the app's secret is wrong or expired.
+  Tell the user to seal a new secret on the server (the message includes the
+  command), then stop. No new sign-in is needed.
 - 403 Forbidden: the user (or the app's permissions) can't access that
   chat/channel, for example a private channel they're not in. Say so.
 - 404 Not found: wrong id, or the user isn't a member. Re-list rather than

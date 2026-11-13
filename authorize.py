@@ -3,11 +3,12 @@
 Normally run through deploy/authorize.sh (installed as msteams-mcp-authorize):
 
   1. prints a Microsoft sign-in URL (authorization code flow with PKCE);
-  2. you open it in any browser, sign in, and the browser ends on the redirect
-     URI with ?code=... in the address bar;
-  3. you paste that URL here (input is not echoed);
-  4. the code is exchanged for tokens, and the refresh token is written to the
-     vault, encrypted with the TPM-sealed vault key. Nothing is written in plain text.
+  2. you open it in any browser and sign in; the browser is redirected to
+     http://localhost/?code=... and shows "can't connect", which is expected;
+  3. you paste that URL from the address bar here (input is not echoed);
+  4. the code is exchanged for tokens using the app's client secret (TPM-sealed,
+     decrypted into memory only), and the refresh token is written to the vault,
+     encrypted with the TPM-sealed vault key. Nothing is written in plain text.
 
 The running service notices the new vault on its next request; no restart needed.
 """
@@ -52,18 +53,24 @@ def read_env_file(path: str | None) -> dict:
     return out
 
 
-def get_vault_key(cred_path: str | None) -> bytes:
+def read_credential(cred_path: str | None, name: str, dev_env: str) -> str:
+    """Decrypt a TPM-sealed systemd credential straight into this process's memory
+    (root only). Without a credential path, fall back to an env var (development)."""
     if cred_path:
-        # root decrypts the TPM-sealed key straight into this process's memory.
-        r = subprocess.run(["systemd-creds", "decrypt", "--name=vault_key", cred_path, "-"],
+        r = subprocess.run(["systemd-creds", "decrypt", f"--name={name}", cred_path, "-"],
                            capture_output=True)
         if r.returncode != 0:
             die(f"cannot decrypt {cred_path}: {r.stderr.decode(errors='replace').strip()}")
-        text = r.stdout.decode()
+        value = r.stdout.decode().rstrip("\r\n")
     else:
-        text = os.environ.get("VAULT_KEY", "")   # development only
-        if not text:
-            die("no vault key: pass --key-cred, or set VAULT_KEY for local development")
+        value = os.environ.get(dev_env, "")
+    if not value:
+        die(f"no {name}: pass its sealed credential, or set {dev_env} for local development")
+    return value
+
+
+def get_vault_key(cred_path: str | None) -> bytes:
+    text = read_credential(cred_path, "vault_key", "VAULT_KEY")
     try:
         return load_key(text)
     except VaultError as e:
@@ -107,6 +114,7 @@ async def run(args: argparse.Namespace) -> None:
     tenant = check_tenant(setting("MS_TENANT_ID"))
     client_id = check_client_id(setting("MS_CLIENT_ID"))
     redirect_uri = setting("MS_REDIRECT_URI", DEFAULT_REDIRECT_URI)
+    client_secret = read_credential(args.secret_cred, "client_secret", "MS_CLIENT_SECRET")
 
     owner = None
     if args.owner:
@@ -139,7 +147,8 @@ async def run(args: argparse.Namespace) -> None:
     })
     print("\n1. Open this URL in a browser and sign in with the account the server should use:\n")
     print(url)
-    print(f"\n2. The browser ends on {redirect_uri}?code=... (the page itself may be blank).")
+    print(f"\n2. The browser is sent to {redirect_uri}?code=... and will most likely show")
+    print("   \"can't connect\": that is expected, nothing needs to listen there.")
     print("   Copy the full URL from the address bar. The code expires in about 10 minutes.\n")
     pasted = getpass.getpass("3. Paste it here (input hidden): ")
     code = extract_code(pasted, state)
@@ -148,6 +157,7 @@ async def run(args: argparse.Namespace) -> None:
         try:
             body = await token_request(http, tenant, {
                 "client_id": client_id,
+                "client_secret": client_secret,
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": redirect_uri,
@@ -183,6 +193,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--env-file", help="systemd EnvironmentFile with MS_TENANT_ID / MS_CLIENT_ID")
     p.add_argument("--key-cred", help="TPM-sealed vault_key credential (systemd-creds)")
+    p.add_argument("--secret-cred", help="TPM-sealed client_secret credential (systemd-creds)")
     p.add_argument("--vault", default="vault.json.enc", help="vault file to write")
     p.add_argument("--owner", help="system user that should own the vault file")
     args = p.parse_args()

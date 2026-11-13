@@ -72,6 +72,7 @@ def _flag(name: str, default: str) -> bool:
 TENANT = check_tenant(_env("MS_TENANT_ID"))
 CLIENT_ID = check_client_id(_env("MS_CLIENT_ID"))
 MCP_TOKEN = _secret("MCP_TOKEN", "mcp_token")          # shared secret for mcp-remote
+CLIENT_SECRET = _secret("MS_CLIENT_SECRET", "client_secret")  # Entra app secret (Web platform)
 try:
     VAULT_KEY = load_key(_secret("VAULT_KEY", "vault_key"))
 except VaultError as e:
@@ -87,7 +88,7 @@ MAX_LIST_TEXT_CHARS = int(os.getenv("MAX_LIST_TEXT_CHARS", "2000"))
 MAX_SEND_BYTES = 28000   # Graph rejects message bodies above ~28 KB
 
 vault = Vault(VAULT_PATH, VAULT_KEY, vault_context(TENANT, CLIENT_ID))
-tokens = TokenManager(vault, TENANT, CLIENT_ID)
+tokens = TokenManager(vault, TENANT, CLIENT_ID, CLIENT_SECRET)
 graph = GraphClient(tokens)
 
 READ_ONLY = {"readOnlyHint": True, "openWorldHint": True}

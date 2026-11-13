@@ -11,12 +11,14 @@ set -euo pipefail
 APP=/opt/msteams-mcp
 ENV_FILE=/etc/msteams-mcp/msteams-mcp.env
 KEY=/etc/credstore.encrypted/msteams-mcp.vault_key.cred
+SECRET=/etc/credstore.encrypted/msteams-mcp.client_secret.cred
 STATE=/var/lib/msteams-mcp
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 [[ -x "$APP/venv/bin/python" ]] || { echo "Not installed yet: sudo ./deploy/install.sh" >&2; exit 1; }
 [[ -f "$ENV_FILE" ]] || { echo "Missing $ENV_FILE: run install.sh" >&2; exit 1; }
 id msteams-mcp >/dev/null 2>&1 || { echo "Missing user msteams-mcp: run install.sh" >&2; exit 1; }
+[[ -f "$SECRET" ]] || { echo "Seal the app's client secret first: sudo $HERE/seal-credential.sh client_secret" >&2; exit 1; }
 if [[ ! -f "$KEY" ]]; then
   echo "==> No vault key yet, generating one"
   "$HERE/seal-credential.sh" vault_key --generate
@@ -25,7 +27,7 @@ install -d -o msteams-mcp -g msteams-mcp -m 0700 "$STATE"
 
 cd "$APP/app"
 "$APP/venv/bin/python" "$APP/app/authorize.py" \
-  --env-file "$ENV_FILE" --key-cred "$KEY" \
+  --env-file "$ENV_FILE" --key-cred "$KEY" --secret-cred "$SECRET" \
   --vault "$STATE/vault.json.enc" --owner msteams-mcp
 
 if ! systemctl is-active --quiet msteams-mcp; then

@@ -46,9 +46,14 @@ echo "==> systemd unit"
 install -m 0644 "$SRC/deploy/msteams-mcp.service" /etc/systemd/system/msteams-mcp.service
 systemctl daemon-reload
 
-if [[ ! -f /etc/credstore.encrypted/msteams-mcp.mcp_token.cred ]]; then
-  echo "    Missing credential: sudo $APP/bin/seal-credential.sh mcp_token --generate"
-elif systemctl is-active --quiet msteams-mcp; then
+missing=0
+for c in "client_secret" "mcp_token --generate"; do
+  if [[ ! -f "/etc/credstore.encrypted/msteams-mcp.${c%% *}.cred" ]]; then
+    echo "    Missing credential: sudo $APP/bin/seal-credential.sh $c"
+    missing=1
+  fi
+done
+if [[ $missing -eq 0 ]] && systemctl is-active --quiet msteams-mcp; then
   systemctl restart msteams-mcp
   echo "==> Restarted msteams-mcp"
 fi

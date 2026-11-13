@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Seal a secret for msteams-mcp with this machine's TPM.
 #
+#   sudo ./seal-credential.sh client_secret          # prompts for the Entra app's client secret
 #   sudo ./seal-credential.sh mcp_token              # prompts (paste your existing token)
 #   sudo ./seal-credential.sh mcp_token --generate   # creates a new random token
 #   sudo ./seal-credential.sh vault_key --generate   # creates the key that encrypts the
@@ -13,10 +14,14 @@ set -euo pipefail
 name="${1:-}"
 mode="${2:-}"
 case "$name" in
-  mcp_token|vault_key) ;;
-  *) echo "usage: sudo $0 mcp_token [--generate] | vault_key --generate [--force]" >&2; exit 2 ;;
+  client_secret|mcp_token|vault_key) ;;
+  *) echo "usage: sudo $0 client_secret | mcp_token [--generate] | vault_key --generate [--force]" >&2; exit 2 ;;
 esac
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+if [[ "$name" == "client_secret" && -n "$mode" ]]; then
+  echo "client_secret can't be generated: paste the secret Value from the app registration" >&2
+  exit 2
+fi
 
 store=/etc/credstore.encrypted
 dest="$store/msteams-mcp.$name.cred"

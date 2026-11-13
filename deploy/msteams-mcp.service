@@ -16,7 +16,9 @@ Environment=HOST=127.0.0.1 PORT=8766 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=
 
 # Secrets: TPM-sealed files, decrypted by systemd at start into
 # /run/credentials/msteams-mcp.service/ (in memory, readable only by this service).
-# vault_key decrypts the refresh-token vault in the state directory.
+# client_secret is the Entra app secret; vault_key decrypts the refresh-token
+# vault in the state directory.
+LoadCredentialEncrypted=client_secret:/etc/credstore.encrypted/msteams-mcp.client_secret.cred
 LoadCredentialEncrypted=mcp_token:/etc/credstore.encrypted/msteams-mcp.mcp_token.cred
 LoadCredentialEncrypted=vault_key:/etc/credstore.encrypted/msteams-mcp.vault_key.cred
 

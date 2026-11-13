@@ -23,8 +23,11 @@ log = logging.getLogger("msteams-mcp.auth")
 AUTHORITY = "https://login.microsoftonline.com"
 # .default = every delegated Graph permission already consented for the app.
 GRAPH_SCOPES = "https://graph.microsoft.com/.default offline_access openid"
-DEFAULT_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+# Must be registered on the app under the "Web" platform (confidential client).
+DEFAULT_REDIRECT_URI = "http://localhost"
 REAUTH_COMMAND = "sudo msteams-mcp-authorize"
+SECRET_COMMAND = ("sudo /opt/msteams-mcp/bin/seal-credential.sh client_secret "
+                  "&& sudo systemctl restart msteams-mcp")
 
 GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 TENANT_RE = re.compile(r"^[A-Za-z0-9.\-]{1,100}$")
@@ -39,6 +42,11 @@ class AuthError(Exception):
 
 class ReauthRequired(AuthError):
     """No usable sign-in: run the interactive authorization on the server."""
+
+
+class ClientSecretError(AuthError):
+    """Entra ID rejected the app's client secret (wrong or expired).
+    Fix: seal the current secret and restart. The sign-in itself is still valid."""
 
 
 def check_client_id(value: str) -> str:
@@ -78,17 +86,24 @@ async def token_request(http: httpx.AsyncClient, tenant: str, form: dict) -> dic
     desc = desc[0] if desc else ""
     if err in _REAUTH_ERRORS:
         raise ReauthRequired(f"{err}: {desc}")
+    if err in ("invalid_client", "unauthorized_client"):
+        # AADSTS7000222 = secret expired, AADSTS7000215 = wrong secret
+        raise ClientSecretError(
+            f"Entra ID rejected the app's client secret ({err}: {desc}). Create a new secret "
+            f"in the app registration if it expired, then on the server: {SECRET_COMMAND}. "
+            f"No new sign-in is needed.")
     raise AuthError(f"Entra ID token endpoint returned {r.status_code} {err}: {desc}")
 
 
 class TokenManager:
     REFRESH_MARGIN = 300  # seconds before expiry at which a new access token is fetched
 
-    def __init__(self, vault: Vault, tenant: str, client_id: str,
+    def __init__(self, vault: Vault, tenant: str, client_id: str, client_secret: str,
                  http: httpx.AsyncClient | None = None):
         self.vault = vault
         self.tenant = tenant
         self.client_id = client_id
+        self._client_secret = client_secret
         self._http = http or httpx.AsyncClient(timeout=30, follow_redirects=False)
         self._lock = asyncio.Lock()
         self._state: dict | None = None
@@ -149,6 +164,7 @@ class TokenManager:
         try:
             body = await token_request(self._http, self.tenant, {
                 "client_id": self.client_id,
+                "client_secret": self._client_secret,
                 "grant_type": "refresh_token",
                 "refresh_token": self._state["refresh_token"],
                 "scope": GRAPH_SCOPES,
@@ -183,6 +199,8 @@ class TokenManager:
             log.info("Keepalive refresh OK")
         except ReauthRequired as e:
             log.warning("Keepalive: %s", e)
+        except ClientSecretError as e:
+            log.error("Keepalive: %s", e)
         except AuthError as e:
             log.warning("Keepalive refresh failed (will retry later): %s", e)
 
