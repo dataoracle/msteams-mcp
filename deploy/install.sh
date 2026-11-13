@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Install or update msteams-mcp as a hardened systemd service.
+# Safe to re-run: keeps /etc/msteams-mcp/msteams-mcp.env, sealed credentials
+# and the stored Microsoft sign-in.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+
+SRC="$(cd "$(dirname "$0")/.." && pwd)"
+APP=/opt/msteams-mcp
+
+python3 -c 'import venv, ensurepip' 2>/dev/null \
+  || { echo "Missing venv support: sudo apt install python3-venv" >&2; exit 1; }
+
+echo "==> Service user"
+if ! id msteams-mcp >/dev/null 2>&1; then
+  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin msteams-mcp
+  echo "    Created system user msteams-mcp"
+fi
+
+echo "==> Copying application to $APP"
+install -d -m 0755 "$APP" "$APP/app" "$APP/bin"
+install -m 0644 "$SRC"/server.py "$SRC"/auth.py "$SRC"/vault.py "$SRC"/graph_client.py \
+  "$SRC"/formatting.py "$SRC"/authorize.py "$SRC"/requirements.txt "$APP/app/"
+install -m 0755 "$SRC"/deploy/authorize.sh "$SRC"/deploy/seal-credential.sh "$APP/bin/"
+ln -sf "$APP/bin/authorize.sh" /usr/local/sbin/msteams-mcp-authorize
+
+echo "==> Python environment"
+[[ -x "$APP/venv/bin/python" ]] || python3 -m venv "$APP/venv"
+"$APP/venv/bin/pip" install --quiet --disable-pip-version-check -r "$APP/app/requirements.txt"
+"$APP/venv/bin/python" -m compileall -q "$APP/app"
+
+echo "==> Configuration"
+install -d -m 0755 /etc/msteams-mcp
+if [[ ! -f /etc/msteams-mcp/msteams-mcp.env ]]; then
+  install -m 0644 "$SRC/deploy/msteams-mcp.env.example" /etc/msteams-mcp/msteams-mcp.env
+  echo "    Created /etc/msteams-mcp/msteams-mcp.env: set MS_TENANT_ID and MS_CLIENT_ID"
+fi
+install -d -o msteams-mcp -g msteams-mcp -m 0700 /var/lib/msteams-mcp
+
+echo "==> Credentials"
+if [[ ! -f /etc/credstore.encrypted/msteams-mcp.vault_key.cred ]]; then
+  "$APP/bin/seal-credential.sh" vault_key --generate
+fi
+
+echo "==> systemd unit"
+install -m 0644 "$SRC/deploy/msteams-mcp.service" /etc/systemd/system/msteams-mcp.service
+systemctl daemon-reload
+
+if [[ ! -f /etc/credstore.encrypted/msteams-mcp.mcp_token.cred ]]; then
+  echo "    Missing credential: sudo $APP/bin/seal-credential.sh mcp_token --generate"
+elif systemctl is-active --quiet msteams-mcp; then
+  systemctl restart msteams-mcp
+  echo "==> Restarted msteams-mcp"
+fi
+[[ -f /var/lib/msteams-mcp/vault.json.enc ]] \
+  || echo "    Not signed in to Microsoft yet: sudo msteams-mcp-authorize"
+echo "Done."

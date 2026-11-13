@@ -1,0 +1,67 @@
+[Unit]
+Description=msteams-mcp: Microsoft Teams MCP server (delegated Graph access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/msteams-mcp/app
+ExecStart=/opt/msteams-mcp/venv/bin/python /opt/msteams-mcp/app/server.py
+Restart=on-failure
+RestartSec=5
+
+# Non-secret settings (tenant, app id, options)
+EnvironmentFile=/etc/msteams-mcp/msteams-mcp.env
+Environment=HOST=127.0.0.1 PORT=8766 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+
+# Secrets: TPM-sealed files, decrypted by systemd at start into
+# /run/credentials/msteams-mcp.service/ (in memory, readable only by this service).
+# vault_key decrypts the refresh-token vault in the state directory.
+LoadCredentialEncrypted=mcp_token:/etc/credstore.encrypted/msteams-mcp.mcp_token.cred
+LoadCredentialEncrypted=vault_key:/etc/credstore.encrypted/msteams-mcp.vault_key.cred
+
+# Identity: a static system user (not DynamicUser) so that msteams-mcp-authorize,
+# run as root, can hand the encrypted vault to the service with stable ownership.
+User=msteams-mcp
+Group=msteams-mcp
+StateDirectory=msteams-mcp
+StateDirectoryMode=0700
+UMask=0077
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel and system
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+
+# Privileges
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Network: IPv4/IPv6 for Entra ID, Graph and the listener, Unix sockets for DNS
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# System calls
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target
