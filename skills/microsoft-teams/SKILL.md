@@ -17,8 +17,8 @@ This skill uses the bare names.
 
 | Tool | Use for |
 |---|---|
-| `list_chats(query?, limit?)` | Finding a chat id; catching up (UNREAD flag, last message) |
-| `read_chat_messages(chat_id, limit?, since?)` | Reading a conversation (oldest first) |
+| `list_chats(query?, limit?, since?)` | Finding a chat id; catching up (UNREAD flag, last message); every chat active since a time |
+| `read_chat_messages(chat_id, limit?, since?)` | Reading a conversation (oldest first); what was said since a time |
 | `get_chat_message(chat_id, message_id)` | One message in full, when a transcript line ends with `[truncated] [id N]` |
 | `get_chat(chat_id)` | Members with emails and roles, meeting link of a meeting chat |
 | `search_messages(query)` | "Where did someone mention X?": keyword search across chats and channels |
@@ -47,6 +47,16 @@ This skill uses the bare names.
    offset) rather than a big limit.
 3. **Catch-up requests** ("anything I missed?"): call `list_chats()`, focus on
    the chats marked UNREAD, and read those with a small limit. Summarise per chat.
+4. **Reviewing a period** ("what happened today?"): convert the start to UTC
+   (for example 00:00 Europe/Madrid is 23:00Z the day before). Then:
+   - Call `list_chats(since=...)`. If the header says "cutoff reached", the list is
+     complete. If it says "limit reached", raise `limit` and call it again.
+   - Call `read_chat_messages(chat_id, since=...)` for each chat.
+   - An older message may appear under its own earlier date line, marked
+     `(edited <time>)`. It was edited during the period, and is not new. Say so if
+     it matters.
+   - Messages that only received reactions are left out. Pass
+     `since_mode="modified"` to include them.
 
 ### Sending (only if the write tools are present)
 
@@ -95,7 +105,9 @@ Read tools return compact text. A chat reads as a transcript:
   - `[file: name]` is an attachment and `[card]` is an adaptive card; their links
     appear only in the full-message tools.
   - `👍2` are reactions, and `!high` / `!urgent` the importance.
-  - `(edited)` and `(deleted)` mean what they say.
+  - `(edited)` and `(deleted)` mean what they say. `(edited 2026-11-13 08:15)`
+    marks an older message returned by `since` because it was edited after the
+    cutoff.
   - `[image]` marks an inline image.
 - **Ids are shown only where you need them:**
   - chat lists end with `id <chat id>`;

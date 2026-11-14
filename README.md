@@ -31,9 +31,9 @@ or a backup without this machine's TPM can't read the token.
 |---|---|
 | `whoami()` | The signed-in account and the state of the sign-in |
 | `find_people(query)` | Directory lookup by name or email: email, title, department |
-| `list_chats(query?, limit?)` | Your chats, most recent first: name, last message, UNREAD flag, chat id |
+| `list_chats(query?, limit?, since?, max_members?)` | Your chats, most recent first: name, last message, UNREAD flag, chat id. With `since`, only chats active since then, and the header says whether the list is complete |
 | `get_chat(chat_id)` | Chat details, full member list, meeting join link |
-| `read_chat_messages(chat_id, limit?, since?, include_system?)` | Recent messages as a transcript, oldest first |
+| `read_chat_messages(chat_id, limit?, since?, since_mode?, include_system?)` | Recent messages as a transcript, oldest first. `since` keeps messages written after it, plus older ones edited after it, marked `(edited <time>)` |
 | `get_chat_message(chat_id, message_id)` | One message in full |
 | `search_messages(query)` | Full-text search over chats and channels (Microsoft Search, KQL) |
 | `list_teams()` | Teams you belong to |
@@ -311,6 +311,12 @@ read -rs MS_CLIENT_SECRET && export MS_CLIENT_SECRET      # paste, no echo, not 
 export VAULT_KEY=$(python -c 'import vault; print(vault.new_key_text())')
 python authorize.py                             # interactive sign-in -> ./vault.json.enc
 python server.py                                # serves http://127.0.0.1:8766/mcp
+```
+
+Offline tests (Graph and Entra ID are mocked, no tenant needed):
+
+```bash
+python tests/test_day_review.py -v              # -v prints sample output
 ```
 
 ## License

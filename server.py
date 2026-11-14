@@ -219,41 +219,80 @@ async def find_people_data(query: str, limit: int) -> list[dict]:
     return [fmt.person(u) for u in rows.get("value") or []]
 
 
-async def _fetch_chats(limit: int) -> tuple[list[dict], bool]:
+CHAT_SCAN = 250  # chats examined at most when filtering by query or since
+
+
+def _since(value: str) -> datetime | None:
+    if not (value or "").strip():
+        return None
+    try:
+        return fmt.parse_time(value).astimezone(timezone.utc)
+    except ValueError:
+        raise ToolError("since must be an ISO 8601 date/time, e.g. 2026-11-13T08:00:00Z") from None
+
+
+async def _scan_chats(limit: int, keep=None, stop=None) -> tuple[list[dict], str]:
     params = {"$top": 50, "$expand": "members,lastMessagePreview",
               "$orderby": "lastMessagePreview/createdDateTime desc"}
+    max_scan = CHAT_SCAN if (keep or stop) else limit + 1
     try:
-        return await graph.get_all("/me/chats", params, limit)
+        return await graph.scan("/me/chats", params, limit, keep=keep, stop=stop, max_scan=max_scan)
     except GraphError as e:
         if e.status != 400:
             raise
         # Fallback if this tenant rejects the combined $expand.
         params["$expand"] = "lastMessagePreview"
-        return await graph.get_all("/me/chats", params, limit)
+        return await graph.scan("/me/chats", params, limit, keep=keep, stop=stop, max_scan=max_scan)
 
 
-async def list_chats_data(query: str, limit: int) -> dict:
+def _last_message_time(c: dict) -> datetime | None:
+    return fmt.utc((c.get("lastMessagePreview") or {}).get("createdDateTime"))
+
+
+async def list_chats_data(query: str, limit: int, since: str = "", max_members: int = 3) -> dict:
     limit = _clamp(limit, 1, 100)
+    max_members = _clamp(max_members, 0, 50)
     q = (query or "").strip().lower()
-    rows, more = await _fetch_chats(250 if q else limit)
-    me = await _me_id()
-    if q:
-        def hit(c: dict) -> bool:
+    cutoff = _since(since)
+
+    def keep(c: dict) -> bool:
+        if cutoff and _last_message_time(c) is None:
+            return False  # no message at all: not "active since"
+        if q:
             names = [m.get("displayName") or "" for m in c.get("members") or []]
             return any(q in s.lower() for s in [c.get("topic") or ""] + names)
-        rows = [c for c in rows if hit(c)]
-    chats = [fmt.chat(c, me) for c in rows[:limit]]
+        return True
+
+    def stop(c: dict) -> bool:
+        # Chats come newest-first by last message: the first one older than the
+        # cutoff means every remaining chat is older too.
+        t = _last_message_time(c)
+        return bool(t and t < cutoff)
+
+    rows, reason = await _scan_chats(limit, keep if (q or cutoff) else None, stop if cutoff else None)
+    me = await _me_id()
+    chats = [fmt.chat(c, me, max_members=max_members) for c in rows]
     out: dict = {"count": len(chats), "chats": chats}
-    if q and more:
-        out["note"] = "only the 250 most recently active chats were searched"
-    elif not q and more:
-        out["note"] = f"more chats exist beyond these {limit}"
+    if cutoff:
+        out["since"] = fmt.iso_z(cutoff)
+    out["complete"] = reason in ("stop", "end")
+    out["status"] = {
+        "stop": "cutoff reached",
+        "end": "all chats listed",
+        "limit": "limit reached, more chats may exist",
+        "scan": f"only the {CHAT_SCAN} most recently active chats were searched",
+    }[reason]
     return out
 
 
 def list_chats_text(d: dict) -> str:
-    return fmt.with_header(f"{d['count']} chats, most recent first (times UTC)",
-                           fmt.render_chats(d["chats"]), d.get("note"))
+    body = fmt.render_chats(d["chats"])
+    if d.get("since"):
+        header = (f"{d['count']} chats active since {d['since'][:16]}Z ({d['status']}), "
+                  "most recent first (times UTC)")
+        return fmt.with_header(header, body)
+    note = None if d["complete"] else d["status"]
+    return fmt.with_header(f"{d['count']} chats, most recent first (times UTC)", body, note)
 
 
 async def get_chat_data(chat_id: str) -> dict:
@@ -286,31 +325,68 @@ def get_chat_text(d: dict) -> str:
     return "\n".join(lines)
 
 
-async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_system: bool) -> dict:
+MESSAGE_SCAN = 1000  # messages examined at most when filtering by since
+
+
+async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_system: bool,
+                                  since_mode: str = "created") -> dict:
     cid = _id(chat_id, "chat_id", "list_chats")
     limit = _clamp(limit, 1, 200)
-    params: dict = {"$top": min(limit, 50)}
-    if since.strip():
-        try:
-            dt = fmt.parse_time(since)
-        except ValueError:
-            raise ToolError("since must be an ISO 8601 date/time, e.g. 2026-11-13T08:00:00Z") from None
+    if since_mode not in ("created", "modified"):
+        raise ToolError("since_mode must be 'created' or 'modified'")
+    cutoff = _since(since)
+    params: dict = {"$top": 50}
+
+    def is_shown(m: dict) -> bool:
+        return include_system or m.get("messageType") in (None, "message")
+
+    if cutoff:
+        # Graph can only filter on lastModifiedDateTime, which also moves when
+        # someone reacts. Fetch that superset and keep what the mode asks for.
         params["$orderby"] = "lastModifiedDateTime desc"
-        params["$filter"] = f"lastModifiedDateTime gt {fmt.iso_z(dt)}"
+        params["$filter"] = f"lastModifiedDateTime gt {fmt.iso_z(cutoff)}"
+
+        def after(value: str | None) -> bool:
+            t = fmt.utc(value)
+            return bool(t and t > cutoff)
+
+        def keep(m: dict) -> bool:
+            if not is_shown(m):
+                return False
+            if since_mode == "modified":
+                return True
+            return after(m.get("createdDateTime")) or after(m.get("lastEditedDateTime"))
+
+        rows, reason = await graph.scan(f"/chats/{cid}/messages", params, limit,
+                                        keep=keep, max_scan=MESSAGE_SCAN)
     else:
         params["$orderby"] = "createdDateTime desc"
-    rows, more = await graph.get_all(f"/chats/{cid}/messages", params, limit)
-    if not include_system:
-        rows = [m for m in rows if m.get("messageType") in (None, "message")]
-    rows.sort(key=lambda m: m.get("createdDateTime") or "")
-    out: dict = {"count": len(rows), "messages": [fmt.message(m, MAX_LIST_TEXT_CHARS) for m in rows]}
-    if more:
-        out["note"] = f"older messages exist beyond these {limit}: raise limit or use since"
+        rows, reason = await graph.scan(f"/chats/{cid}/messages", params, limit,
+                                        keep=is_shown, max_scan=MESSAGE_SCAN)
+    rows.sort(key=lambda m: fmt.utc(m.get("createdDateTime")) or datetime.min.replace(tzinfo=timezone.utc))
+    messages = []
+    for m in rows:
+        d = fmt.message(m, MAX_LIST_TEXT_CHARS)
+        created = fmt.utc(m.get("createdDateTime"))
+        # An older message is here only because it changed after the cutoff:
+        # say when it was edited, so the reader knows why it is listed.
+        if cutoff and d.get("edited") and created and created <= cutoff:
+            d["edited"] = m["lastEditedDateTime"]
+        messages.append(d)
+    out: dict = {"count": len(messages), "messages": messages}
+    if cutoff:
+        out["since"] = fmt.iso_z(cutoff)
+    if reason == "limit":
+        out["note"] = (f"more messages since the cutoff exist beyond these {limit}: raise limit"
+                       if cutoff else f"older messages exist beyond these {limit}: raise limit or use since")
+    elif reason == "scan":
+        out["note"] = f"stopped after examining {MESSAGE_SCAN} messages; more may exist"
     return out
 
 
 def read_chat_messages_text(d: dict) -> str:
-    return fmt.with_header(f"{d['count']} messages, oldest first (times UTC)",
+    since = f" since {d['since'][:16]}Z" if d.get("since") else ""
+    return fmt.with_header(f"{d['count']} messages{since}, oldest first (times UTC)",
                            fmt.render_messages(d["messages"]), d.get("note"))
 
 
@@ -322,8 +398,6 @@ async def get_chat_message_data(chat_id: str, message_id: str) -> dict:
 
 def full_message_text(d: dict) -> str:
     lines = ["Message (times UTC)", fmt.render_messages([d], ids="all")]
-    if isinstance(d.get("edited"), str):
-        lines.append(f"Edited {fmt.short_time(d['edited'])}")
     if d.get("reply_to_id"):
         lines.append(f"Reply to message {d['reply_to_id']}")
     if d.get("web_url"):
@@ -567,11 +641,16 @@ async def find_people(query: str, limit: int = 10, output: str = "text") -> str:
 
 
 @mcp.tool(**READ)
-async def list_chats(query: str = "", limit: int = 25, output: str = "text") -> str:
+async def list_chats(query: str = "", limit: int = 25, since: str = "", max_members: int = 3,
+                     output: str = "text") -> str:
     """The signed-in user's chats (1:1, group, meeting), most recently active
-    first: name, last message, UNREAD flag and chat id. With query, keeps only
-    chats whose title or member names contain it (case-insensitive)."""
-    return await _run(list_chats_data(query, limit), list_chats_text, output)
+    first: name, last message, UNREAD flag and chat id. limit is 1-100.
+    query keeps only chats whose title or member names contain it (case-insensitive).
+    since (ISO 8601, e.g. 2026-11-13T00:00:00Z) returns only chats with a message
+    at or after that time; the header says "cutoff reached" when that list is
+    complete, or "limit reached" when more may exist. max_members caps the member
+    names shown for titled group chats (0 = only a count)."""
+    return await _run(list_chats_data(query, limit, since, max_members), list_chats_text, output)
 
 
 @mcp.tool(**READ)
@@ -583,12 +662,15 @@ async def get_chat(chat_id: str, output: str = "text") -> str:
 
 @mcp.tool(**READ)
 async def read_chat_messages(chat_id: str, limit: int = 30, since: str = "",
-                             include_system: bool = False, output: str = "text") -> str:
+                             since_mode: str = "created", include_system: bool = False,
+                             output: str = "text") -> str:
     """Recent messages in a chat as a transcript, oldest first. limit is 1-200.
-    since (ISO 8601, e.g. 2026-11-13T08:00:00Z) returns only messages created or
-    edited after that time. System events are left out unless include_system.
-    Long messages end with [truncated] [id N]: get_chat_message gives the full text."""
-    return await _run(read_chat_messages_data(chat_id, limit, since, include_system),
+    since (ISO 8601, e.g. 2026-11-13T08:00:00Z) returns messages created after
+    that time, plus older ones edited after it, marked "(edited <time>)".
+    since_mode="modified" also returns older messages that only got reactions.
+    System events are left out unless include_system. Long messages end with
+    [truncated] [id N]: get_chat_message gives the full text."""
+    return await _run(read_chat_messages_data(chat_id, limit, since, include_system, since_mode),
                       read_chat_messages_text, output)
 
 

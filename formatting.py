@@ -48,10 +48,19 @@ def html_to_text(content: str) -> str:
     p = _TextExtractor()
     p.feed(content or "")
     p.close()
-    text = "".join(p.out).replace("\u00a0", " ")
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n\s*\n+", "\n", text)  # paragraph breaks -> single line breaks
-    return text.strip()
+    return tidy("".join(p.out))
+
+
+# Whitespace Teams puts in message bodies, including the invisible kinds that
+# str.strip() keeps (zero-width space, word joiner, BOM).
+_WS = " \t\u00a0\u2007\u202f\u200b\u2060\ufeff"
+
+
+def tidy(text: str) -> str:
+    """Trim every line and drop blank lines, so a transcript's continuation
+    lines all share one indent whatever spacing the message started with."""
+    lines = (ln.strip(_WS) for ln in (text or "").replace("\r\n", "\n").split("\n"))
+    return "\n".join(ln for ln in lines if ln)
 
 
 def strip_search_markup(s: str) -> str:
@@ -73,11 +82,15 @@ def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _t(value: str | None) -> datetime | None:
+def utc(value: str | None) -> datetime | None:
+    """Parse a Graph timestamp to an aware UTC datetime; None if missing or invalid."""
     try:
         return parse_time(value).astimezone(timezone.utc) if value else None
     except ValueError:
         return None
+
+
+_t = utc
 
 
 def short_time(value: str | None) -> str:
@@ -120,7 +133,7 @@ def message(m: dict, max_chars: int | None = None, full: bool = False) -> dict:
     timestamps of edits, the replied-to id and longer quote previews."""
     body = m.get("body") or {}
     content = body.get("content") or ""
-    text = html_to_text(content) if (body.get("contentType") or "").lower() == "html" else content.strip()
+    text = html_to_text(content) if (body.get("contentType") or "").lower() == "html" else tidy(content)
     out: dict = {"message_id": m.get("id"), "created": m.get("createdDateTime"),
                  "from": who(m.get("from")), "text": text}
     if max_chars and len(text) > max_chars:
@@ -203,7 +216,8 @@ def _names(names: list[str], cap: int = 5) -> str:
 CHAT_TYPES = {"oneOnOne": "1:1", "group": "group", "meeting": "meeting"}
 
 
-def chat(c: dict, me_id: str | None, preview_chars: int = 80, full: bool = False) -> dict:
+def chat(c: dict, me_id: str | None, preview_chars: int = 80, full: bool = False,
+         max_members: int = 3) -> dict:
     others = [m.get("displayName") for m in c.get("members") or []
               if m.get("userId") != me_id and m.get("displayName")]
     ctype = CHAT_TYPES.get(c.get("chatType") or "", c.get("chatType"))
@@ -211,7 +225,10 @@ def chat(c: dict, me_id: str | None, preview_chars: int = 80, full: bool = False
     out: dict = {"chat_id": c.get("id"), "name": name, "type": ctype}
     # Members only add information for titled group chats (otherwise the name is the members).
     if others and c.get("topic") and ctype != "1:1":
-        out["members"] = _names(others)
+        if full or max_members > 0:
+            out["members"] = _names(others, len(others) if full else max_members)
+        else:
+            out["members"] = f"{len(others)} others"
     prev = c.get("lastMessagePreview") or {}
     if prev:
         body = prev.get("body") or {}
@@ -252,7 +269,9 @@ def _message_body(d: dict, show_id: bool) -> str:
         tail.append(d["reactions"])
     if d.get("importance"):
         tail.append(f"!{d['importance']}")
-    if d.get("edited"):
+    if isinstance(d.get("edited"), str):
+        tail.append(f"(edited {short_time(d['edited'])})")
+    elif d.get("edited"):
         tail.append("(edited)")
     if d.get("deleted"):
         tail.append("(deleted)")
