@@ -166,7 +166,22 @@ def test_since_limit_counts_kept_messages_only():
     out = asyncio.run(call("read_chat_messages", chat_id=GROUP, since=SINCE, limit=2))
     # The reaction-only message must not use up one of the two slots.
     assert out.splitlines()[0].startswith("2 messages") and "old announcement" not in out, out
-    assert out.endswith("(more messages since the cutoff exist beyond these 2: raise limit)"), out
+    # Default keep="newest": the two latest by creation time; the footer says the
+    # earliest one was dropped.
+    assert "budget is 40k" not in out and "06:05 Alice" in out, out
+    assert out.endswith("(1 earlier message since the cutoff omitted: raise limit, "
+                        "or pass keep='oldest' to read from the cutoff forward)"), out
+
+
+def test_since_keep_oldest_reads_forward_from_cutoff():
+    out = asyncio.run(call("read_chat_messages", chat_id=GROUP, since=SINCE, limit=2, keep="oldest"))
+    lines = out.splitlines()
+    assert lines[1:3] == ["2026-11-10", "15:30 Carol: budget is 40k (edited 2026-11-13 08:15)"], out
+    assert "06:05 Alice" in out and "new secret is sealed" not in out, out
+    assert out.endswith("(1 later message since the cutoff omitted: raise limit, "
+                        "or pass keep='newest' for the latest ones)"), out
+    bad = asyncio.run(call("read_chat_messages", chat_id=GROUP, since=SINCE, keep="middle"))
+    assert "keep must be" in bad, bad
 
 
 def test_message_starting_with_line_break_keeps_one_indent():

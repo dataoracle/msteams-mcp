@@ -329,11 +329,13 @@ MESSAGE_SCAN = 1000  # messages examined at most when filtering by since
 
 
 async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_system: bool,
-                                  since_mode: str = "created") -> dict:
+                                  since_mode: str = "created", keep_end: str = "newest") -> dict:
     cid = _id(chat_id, "chat_id", "list_chats")
     limit = _clamp(limit, 1, 200)
     if since_mode not in ("created", "modified"):
         raise ToolError("since_mode must be 'created' or 'modified'")
+    if keep_end not in ("newest", "oldest"):
+        raise ToolError("keep must be 'newest' or 'oldest'")
     cutoff = _since(since)
     params: dict = {"$top": 50}
 
@@ -357,13 +359,19 @@ async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_
                 return True
             return after(m.get("createdDateTime")) or after(m.get("lastEditedDateTime"))
 
-        rows, reason = await graph.scan(f"/chats/{cid}/messages", params, limit,
+        # Graph returns them by last modification, not creation: collect them
+        # all, then cut by creation time from the end the caller asked for.
+        rows, reason = await graph.scan(f"/chats/{cid}/messages", params, MESSAGE_SCAN,
                                         keep=keep, max_scan=MESSAGE_SCAN)
     else:
         params["$orderby"] = "createdDateTime desc"
         rows, reason = await graph.scan(f"/chats/{cid}/messages", params, limit,
                                         keep=is_shown, max_scan=MESSAGE_SCAN)
     rows.sort(key=lambda m: fmt.utc(m.get("createdDateTime")) or datetime.min.replace(tzinfo=timezone.utc))
+    omitted = 0
+    if cutoff and len(rows) > limit:
+        omitted = len(rows) - limit
+        rows = rows[:limit] if keep_end == "oldest" else rows[-limit:]
     messages = []
     for m in rows:
         d = fmt.message(m, MAX_LIST_TEXT_CHARS)
@@ -376,11 +384,23 @@ async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_
     out: dict = {"count": len(messages), "messages": messages}
     if cutoff:
         out["since"] = fmt.iso_z(cutoff)
-    if reason == "limit":
-        out["note"] = (f"more messages since the cutoff exist beyond these {limit}: raise limit"
-                       if cutoff else f"older messages exist beyond these {limit}: raise limit or use since")
+    more = "+" if reason in ("scan", "limit") else ""  # stopped early: there may be even more
+    noun = "message" if omitted == 1 and not more else "messages"
+    if cutoff and omitted:
+        if keep_end == "oldest":
+            out["note"] = (f"{omitted}{more} later {noun} since the cutoff omitted: "
+                           "raise limit, or pass keep='newest' for the latest ones")
+        else:
+            out["note"] = (f"{omitted}{more} earlier {noun} since the cutoff omitted: "
+                           "raise limit, or pass keep='oldest' to read from the cutoff forward")
+    elif cutoff and more:
+        out["note"] = f"stopped after examining {MESSAGE_SCAN} messages; earlier ones may be missing"
+    elif reason == "limit":
+        out["note"] = f"older messages exist beyond these {limit}: raise limit or use since"
     elif reason == "scan":
         out["note"] = f"stopped after examining {MESSAGE_SCAN} messages; more may exist"
+    if cutoff:
+        out["omitted"] = omitted
     return out
 
 
@@ -662,15 +682,17 @@ async def get_chat(chat_id: str, output: str = "text") -> str:
 
 @mcp.tool(**READ)
 async def read_chat_messages(chat_id: str, limit: int = 30, since: str = "",
-                             since_mode: str = "created", include_system: bool = False,
-                             output: str = "text") -> str:
+                             since_mode: str = "created", keep: str = "newest",
+                             include_system: bool = False, output: str = "text") -> str:
     """Recent messages in a chat as a transcript, oldest first. limit is 1-200.
     since (ISO 8601, e.g. 2026-11-13T08:00:00Z) returns messages created after
     that time, plus older ones edited after it, marked "(edited <time>)".
     since_mode="modified" also returns older messages that only got reactions.
+    When more messages match since than limit, keep="newest" (default) drops the
+    earliest ones and keep="oldest" drops the latest; the footer says how many.
     System events are left out unless include_system. Long messages end with
     [truncated] [id N]: get_chat_message gives the full text."""
-    return await _run(read_chat_messages_data(chat_id, limit, since, include_system, since_mode),
+    return await _run(read_chat_messages_data(chat_id, limit, since, include_system, since_mode, keep),
                       read_chat_messages_text, output)
 
 

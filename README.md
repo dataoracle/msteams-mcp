@@ -33,7 +33,7 @@ or a backup without this machine's TPM can't read the token.
 | `find_people(query)` | Directory lookup by name or email: email, title, department |
 | `list_chats(query?, limit?, since?, max_members?)` | Your chats, most recent first: name, last message, UNREAD flag, chat id. With `since`, only chats active since then, and the header says whether the list is complete |
 | `get_chat(chat_id)` | Chat details, full member list, meeting join link |
-| `read_chat_messages(chat_id, limit?, since?, since_mode?, include_system?)` | Recent messages as a transcript, oldest first. `since` keeps messages written after it, plus older ones edited after it, marked `(edited <time>)` |
+| `read_chat_messages(chat_id, limit?, since?, since_mode?, keep?, include_system?)` | Recent messages as a transcript, oldest first. `since` keeps messages written after it, plus older ones edited after it, marked `(edited <time>)`. If more match than `limit`, `keep="newest"` (default) or `"oldest"` picks the end to keep, and the footer says how many were left out |
 | `get_chat_message(chat_id, message_id)` | One message in full |
 | `search_messages(query)` | Full-text search over chats and channels (Microsoft Search, KQL) |
 | `list_teams()` | Teams you belong to |

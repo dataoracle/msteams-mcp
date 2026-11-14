@@ -51,7 +51,10 @@ This skill uses the bare names.
    (for example 00:00 Europe/Madrid is 23:00Z the day before). Then:
    - Call `list_chats(since=...)`. If the header says "cutoff reached", the list is
      complete. If it says "limit reached", raise `limit` and call it again.
-   - Call `read_chat_messages(chat_id, since=...)` for each chat.
+   - Call `read_chat_messages(chat_id, since=...)` for each chat. If more
+     messages match than `limit`, the newest are kept and the footer says how
+     many earlier ones were left out. Pass `keep="oldest"` to read forward from
+     the start of the period, or raise `limit`.
    - An older message may appear under its own earlier date line, marked
      `(edited <time>)`. It was edited during the period, and is not new. Say so if
      it matters.
