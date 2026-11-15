@@ -30,10 +30,10 @@ or a backup without this machine's TPM can't read the token.
 | Tool | Returns / does |
 |---|---|
 | `whoami()` | The signed-in account and the state of the sign-in |
-| `find_people(query)` | Directory lookup by name or email: email, user_id, title, department |
-| `list_chats(query?, limit?)` | Your chats, most recent first: chat_id, name, members, last message preview, unread flag |
+| `find_people(query)` | Directory lookup by name or email: email, title, department |
+| `list_chats(query?, limit?, since?, max_members?)` | Your chats, most recent first: name, last message, UNREAD flag, chat id. With `since`, only chats active since then, and the header says whether the list is complete |
 | `get_chat(chat_id)` | Chat details, full member list, meeting join link |
-| `read_chat_messages(chat_id, limit?, since?, include_system?)` | Recent messages, oldest first, as plain text |
+| `read_chat_messages(chat_id, limit?, since?, since_mode?, keep?, include_system?)` | Recent messages as a transcript, oldest first. `since` keeps messages written after it, plus older ones edited after it, marked `(edited <time>)`. If more match than `limit`, `keep="newest"` (default) or `"oldest"` picks the end to keep, and the footer says how many were left out |
 | `get_chat_message(chat_id, message_id)` | One message in full |
 | `search_messages(query)` | Full-text search over chats and channels (Microsoft Search, KQL) |
 | `list_teams()` | Teams you belong to |
@@ -47,11 +47,31 @@ or a backup without this machine's TPM can't read the token.
 | `reply_to_channel_message(team_id, channel_id, message_id, content, format?)` ✏️ | Reply in a channel thread |
 | `create_online_meeting(subject, start?, end?)` ✏️ | Teams meeting link (no calendar invite) |
 
+**Output.** Read tools return compact text to keep the agent's token use low:
+- a chat reads as a transcript, with one date line per day and `HH:MM Sender: text` per message;
+- consecutive messages from the same person are grouped;
+- times are in UTC;
+- ids appear only where a follow-up call needs them: chat ids, post ids, and `[id N]` on messages cut at
+  `MAX_LIST_TEXT_CHARS`;
+- links to open items in Teams and attachment URLs appear only in the single-item tools (`get_chat`,
+  `get_chat_message`, `get_channel_thread`).
+
+Every read tool also takes `output="json"` for structured data instead. For example, `read_chat_messages` returns:
+
+```
+3 messages, oldest first (times UTC)
+2026-11-13
+10:01 Alice Johnson: Can you check the Q4 numbers? [file: Q4 Forecast.xlsx]
+      The vendor call moved to Thursday 👍2
+10:20 Bob Smith: ↪ Alice Johnson: "Can you check the Q4 numbers?"
+      On it (edited)
+```
+
 ✏️ = write tools, registered only when `ENABLE_WRITE_TOOLS=true` (the default).
 Set it to `false` for a read-only server. The send tools take `format="text"`
 (sent as typed, line breaks kept) or `format="html"` (Teams HTML). To avoid
-messaging the wrong person, `send_direct_message` takes an email address or
-user_id, not a name.
+messaging the wrong person, `send_direct_message` takes an email address (or
+user id), not a name.
 
 ## Requirements
 
@@ -291,6 +311,12 @@ read -rs MS_CLIENT_SECRET && export MS_CLIENT_SECRET      # paste, no echo, not 
 export VAULT_KEY=$(python -c 'import vault; print(vault.new_key_text())')
 python authorize.py                             # interactive sign-in -> ./vault.json.enc
 python server.py                                # serves http://127.0.0.1:8766/mcp
+```
+
+Offline tests (Graph and Entra ID are mocked, no tenant needed):
+
+```bash
+python tests/test_day_review.py -v              # -v prints sample output
 ```
 
 ## License

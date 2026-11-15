@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import html
+import json
 import logging
 import os
 import re
@@ -102,6 +103,7 @@ mcp = FastMCP(
         "(delegated permissions). Use list_chats to find a chat_id, then read_chat_messages. "
         "Use search_messages to find messages by keyword across chats and channels. "
         "For channels, use list_teams, then list_channels, then read_channel_messages. "
+        "Read tools return compact text (times in UTC); pass output='json' for structured data. "
         + ("Messages you send appear as the signed-in user and cannot be unsent from here: "
            "confirm the recipient and wording with the user before calling any send_ or "
            "reply_ tool." if ENABLE_WRITE else
@@ -111,6 +113,8 @@ mcp = FastMCP(
 
 # ---------------------------------------------------------------- helpers
 ID_RE = re.compile(r"^[A-Za-z0-9:@._=\-]{1,400}$")
+# Tools return plain text: no output schema, so FastMCP doesn't also send a structured copy.
+READ = {"annotations": READ_ONLY, "output_schema": None}
 
 
 def _id(value: str, label: str, source: str) -> str:
@@ -139,6 +143,17 @@ async def _call(coro):
         raise ToolError(str(e)) from e
 
 
+async def _run(coro, render, output: str = "text") -> str:
+    """Run a data function; return compact text (default) or compact JSON."""
+    if output not in ("text", "json"):
+        coro.close()
+        raise ToolError("output must be 'text' or 'json'.")
+    data = await _call(coro)
+    if output == "json":
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return render(data)
+
+
 async def _me_id() -> str:
     uid = tokens.user.get("id")
     if not uid:
@@ -162,18 +177,25 @@ def _body(content: str, format: str) -> dict:
     return {"contentType": "html", "content": body}
 
 
-def _sent(m: dict, **ids) -> dict:
-    return {"sent": True, **ids, "message_id": m.get("id"), "created": m.get("createdDateTime"),
-            **({"web_url": m["webUrl"]} if m.get("webUrl") else {})}
-
-
 PERSON_FIELDS = "id,displayName,mail,userPrincipalName,jobTitle,department,officeLocation"
 
 
 # ---------------------------------------------------------------- data functions
 async def whoami_data() -> dict:
     me = await graph.get("/me", {"$select": PERSON_FIELDS})
-    return {"user": fmt.person(me), "auth": tokens.info()}
+    return {"user": fmt.person(me), "auth": {k: v for k, v in tokens.info().items() if v}}
+
+
+def whoami_text(d: dict) -> str:
+    a = d["auth"]
+    return "\n".join([
+        "Signed in as " + fmt.render_people([d["user"]]).removeprefix("• "),
+        f"Auth: {a.get('status')}"
+        + (f" · signed in {fmt.short_time(a['signed_in_at'])}" if a.get("signed_in_at") else "")
+        + (f" · token rotated {fmt.short_time(a['refresh_token_rotated_at'])}"
+           if a.get("refresh_token_rotated_at") else "")
+        + (f" · problem: {a['problem']}" if a.get("problem") else ""),
+    ])
 
 
 async def find_people_data(query: str, limit: int) -> list[dict]:
@@ -197,40 +219,87 @@ async def find_people_data(query: str, limit: int) -> list[dict]:
     return [fmt.person(u) for u in rows.get("value") or []]
 
 
-async def _fetch_chats(limit: int) -> tuple[list[dict], bool]:
+CHAT_SCAN = 250  # chats examined at most when filtering by query or since
+
+
+def _since(value: str) -> datetime | None:
+    if not (value or "").strip():
+        return None
+    try:
+        return fmt.parse_time(value).astimezone(timezone.utc)
+    except ValueError:
+        raise ToolError("since must be an ISO 8601 date/time, e.g. 2026-11-13T08:00:00Z") from None
+
+
+async def _scan_chats(limit: int, keep=None, stop=None) -> tuple[list[dict], str]:
     params = {"$top": 50, "$expand": "members,lastMessagePreview",
               "$orderby": "lastMessagePreview/createdDateTime desc"}
+    max_scan = CHAT_SCAN if (keep or stop) else limit + 1
     try:
-        return await graph.get_all("/me/chats", params, limit)
+        return await graph.scan("/me/chats", params, limit, keep=keep, stop=stop, max_scan=max_scan)
     except GraphError as e:
         if e.status != 400:
             raise
         # Fallback if this tenant rejects the combined $expand.
         params["$expand"] = "lastMessagePreview"
-        return await graph.get_all("/me/chats", params, limit)
+        return await graph.scan("/me/chats", params, limit, keep=keep, stop=stop, max_scan=max_scan)
 
 
-async def list_chats_data(query: str, limit: int) -> dict:
+def _last_message_time(c: dict) -> datetime | None:
+    return fmt.utc((c.get("lastMessagePreview") or {}).get("createdDateTime"))
+
+
+async def list_chats_data(query: str, limit: int, since: str = "", max_members: int = 3) -> dict:
     limit = _clamp(limit, 1, 100)
+    max_members = _clamp(max_members, 0, 50)
     q = (query or "").strip().lower()
-    rows, more = await _fetch_chats(250 if q else limit)
+    cutoff = _since(since)
+
+    def keep(c: dict) -> bool:
+        if cutoff and _last_message_time(c) is None:
+            return False  # no message at all: not "active since"
+        if q:
+            names = [m.get("displayName") or "" for m in c.get("members") or []]
+            return any(q in s.lower() for s in [c.get("topic") or ""] + names)
+        return True
+
+    def stop(c: dict) -> bool:
+        # Chats come newest-first by last message: the first one older than the
+        # cutoff means every remaining chat is older too.
+        t = _last_message_time(c)
+        return bool(t and t < cutoff)
+
+    rows, reason = await _scan_chats(limit, keep if (q or cutoff) else None, stop if cutoff else None)
     me = await _me_id()
-    chats = [fmt.chat(c, me) for c in rows]
-    if q:
-        chats = [c for c in chats
-                 if q in c["name"].lower() or any(q in m.lower() for m in c.get("members", []))]
-    out = {"count": min(len(chats), limit), "chats": chats[:limit]}
-    if q and more:
-        out["note"] = "Only the 250 most recently active chats were searched."
-    elif not q and more:
-        out["note"] = f"Showing the {limit} most recently active chats; more exist."
+    chats = [fmt.chat(c, me, max_members=max_members) for c in rows]
+    out: dict = {"count": len(chats), "chats": chats}
+    if cutoff:
+        out["since"] = fmt.iso_z(cutoff)
+    out["complete"] = reason in ("stop", "end")
+    out["status"] = {
+        "stop": "cutoff reached",
+        "end": "all chats listed",
+        "limit": "limit reached, more chats may exist",
+        "scan": f"only the {CHAT_SCAN} most recently active chats were searched",
+    }[reason]
     return out
+
+
+def list_chats_text(d: dict) -> str:
+    body = fmt.render_chats(d["chats"])
+    if d.get("since"):
+        header = (f"{d['count']} chats active since {d['since'][:16]}Z ({d['status']}), "
+                  "most recent first (times UTC)")
+        return fmt.with_header(header, body)
+    note = None if d["complete"] else d["status"]
+    return fmt.with_header(f"{d['count']} chats, most recent first (times UTC)", body, note)
 
 
 async def get_chat_data(chat_id: str) -> dict:
     cid = _id(chat_id, "chat_id", "list_chats")
     c = await graph.get(f"/chats/{cid}", {"$expand": "members"})
-    out = fmt.chat(c, await _me_id())
+    out = fmt.chat(c, await _me_id(), full=True)
+    out.pop("members", None)
     out.update({
         "topic": c.get("topic"),
         "created": c.get("createdDateTime"),
@@ -239,37 +308,121 @@ async def get_chat_data(chat_id: str) -> dict:
     meeting = c.get("onlineMeetingInfo") or {}
     if meeting.get("joinWebUrl"):
         out["meeting_join_url"] = meeting["joinWebUrl"]
-    return out
+    return {k: v for k, v in out.items() if v not in (None, "")}
 
 
-async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_system: bool) -> dict:
+def get_chat_text(d: dict) -> str:
+    lines = [f"{d['name']} ({d.get('type')}) · created {fmt.short_time(d.get('created'))} · id {d['chat_id']}"]
+    if d.get("last_message_at"):
+        lines.append(f"Last message {fmt.short_time(d['last_message_at'])} UTC "
+                     f"{d.get('last_message_from') or '?'}: {d.get('last_message_preview', '')}")
+    lines.append(f"Members ({len(d['members'])}):")
+    lines.append(fmt.render_members(d["members"]))
+    if d.get("meeting_join_url"):
+        lines.append(f"Meeting join link: {d['meeting_join_url']}")
+    if d.get("web_url"):
+        lines.append(f"Open in Teams: {d['web_url']}")
+    return "\n".join(lines)
+
+
+MESSAGE_SCAN = 1000  # messages examined at most when filtering by since
+
+
+async def read_chat_messages_data(chat_id: str, limit: int, since: str, include_system: bool,
+                                  since_mode: str = "created", keep_end: str = "newest") -> dict:
     cid = _id(chat_id, "chat_id", "list_chats")
     limit = _clamp(limit, 1, 200)
-    params: dict = {"$top": min(limit, 50)}
-    if since.strip():
-        try:
-            dt = fmt.parse_time(since)
-        except ValueError:
-            raise ToolError("since must be an ISO 8601 date/time, e.g. 2026-11-13T08:00:00Z") from None
+    if since_mode not in ("created", "modified"):
+        raise ToolError("since_mode must be 'created' or 'modified'")
+    if keep_end not in ("newest", "oldest"):
+        raise ToolError("keep must be 'newest' or 'oldest'")
+    cutoff = _since(since)
+    params: dict = {"$top": 50}
+
+    def is_shown(m: dict) -> bool:
+        return include_system or m.get("messageType") in (None, "message")
+
+    if cutoff:
+        # Graph can only filter on lastModifiedDateTime, which also moves when
+        # someone reacts. Fetch that superset and keep what the mode asks for.
         params["$orderby"] = "lastModifiedDateTime desc"
-        params["$filter"] = f"lastModifiedDateTime gt {fmt.iso_z(dt)}"
+        params["$filter"] = f"lastModifiedDateTime gt {fmt.iso_z(cutoff)}"
+
+        def after(value: str | None) -> bool:
+            t = fmt.utc(value)
+            return bool(t and t > cutoff)
+
+        def keep(m: dict) -> bool:
+            if not is_shown(m):
+                return False
+            if since_mode == "modified":
+                return True
+            return after(m.get("createdDateTime")) or after(m.get("lastEditedDateTime"))
+
+        # Graph returns them by last modification, not creation: collect them
+        # all, then cut by creation time from the end the caller asked for.
+        rows, reason = await graph.scan(f"/chats/{cid}/messages", params, MESSAGE_SCAN,
+                                        keep=keep, max_scan=MESSAGE_SCAN)
     else:
         params["$orderby"] = "createdDateTime desc"
-    rows, more = await graph.get_all(f"/chats/{cid}/messages", params, limit)
-    if not include_system:
-        rows = [m for m in rows if m.get("messageType") in (None, "message")]
-    rows.sort(key=lambda m: m.get("createdDateTime") or "")
-    out = {"chat_id": cid, "count": len(rows), "order": "oldest first",
-           "messages": [fmt.message(m, MAX_LIST_TEXT_CHARS) for m in rows]}
-    if more:
-        out["note"] = f"Showing the latest {limit} messages; older ones exist (raise limit or use since)."
+        rows, reason = await graph.scan(f"/chats/{cid}/messages", params, limit,
+                                        keep=is_shown, max_scan=MESSAGE_SCAN)
+    rows.sort(key=lambda m: fmt.utc(m.get("createdDateTime")) or datetime.min.replace(tzinfo=timezone.utc))
+    omitted = 0
+    if cutoff and len(rows) > limit:
+        omitted = len(rows) - limit
+        rows = rows[:limit] if keep_end == "oldest" else rows[-limit:]
+    messages = []
+    for m in rows:
+        d = fmt.message(m, MAX_LIST_TEXT_CHARS)
+        created = fmt.utc(m.get("createdDateTime"))
+        # An older message is here only because it changed after the cutoff:
+        # say when it was edited, so the reader knows why it is listed.
+        if cutoff and d.get("edited") and created and created <= cutoff:
+            d["edited"] = m["lastEditedDateTime"]
+        messages.append(d)
+    out: dict = {"count": len(messages), "messages": messages}
+    if cutoff:
+        out["since"] = fmt.iso_z(cutoff)
+    more = "+" if reason in ("scan", "limit") else ""  # stopped early: there may be even more
+    noun = "message" if omitted == 1 and not more else "messages"
+    if cutoff and omitted:
+        if keep_end == "oldest":
+            out["note"] = (f"{omitted}{more} later {noun} since the cutoff omitted: "
+                           "raise limit, or pass keep='newest' for the latest ones")
+        else:
+            out["note"] = (f"{omitted}{more} earlier {noun} since the cutoff omitted: "
+                           "raise limit, or pass keep='oldest' to read from the cutoff forward")
+    elif cutoff and more:
+        out["note"] = f"stopped after examining {MESSAGE_SCAN} messages; earlier ones may be missing"
+    elif reason == "limit":
+        out["note"] = f"older messages exist beyond these {limit}: raise limit or use since"
+    elif reason == "scan":
+        out["note"] = f"stopped after examining {MESSAGE_SCAN} messages; more may exist"
+    if cutoff:
+        out["omitted"] = omitted
     return out
+
+
+def read_chat_messages_text(d: dict) -> str:
+    since = f" since {d['since'][:16]}Z" if d.get("since") else ""
+    return fmt.with_header(f"{d['count']} messages{since}, oldest first (times UTC)",
+                           fmt.render_messages(d["messages"]), d.get("note"))
 
 
 async def get_chat_message_data(chat_id: str, message_id: str) -> dict:
     cid = _id(chat_id, "chat_id", "list_chats")
     mid = _id(message_id, "message_id", "read_chat_messages")
-    return fmt.message(await graph.get(f"/chats/{cid}/messages/{mid}"))
+    return fmt.message(await graph.get(f"/chats/{cid}/messages/{mid}"), full=True)
+
+
+def full_message_text(d: dict) -> str:
+    lines = ["Message (times UTC)", fmt.render_messages([d], ids="all")]
+    if d.get("reply_to_id"):
+        lines.append(f"Reply to message {d['reply_to_id']}")
+    if d.get("web_url"):
+        lines.append(f"Open in Teams: {d['web_url']}")
+    return "\n".join(lines)
 
 
 async def search_messages_data(query: str, limit: int) -> dict:
@@ -297,34 +450,56 @@ async def search_messages_data(query: str, limit: int) -> dict:
                     "team_id": channel.get("teamId"),
                     "channel_id": channel.get("channelId"),
                     "message_id": res.get("id"),
-                    "web_url": res.get("webUrl"),
                 }.items() if val})
     return {"query": q, "count": len(hits), "hits": hits}
 
 
+def search_text(d: dict) -> str:
+    return fmt.with_header(f"{d['count']} results for {d['query']!r} (times UTC)", fmt.render_hits(d["hits"]))
+
+
 async def list_teams_data() -> list[dict]:
     rows, _ = await graph.get_all("/me/joinedTeams", {"$select": "id,displayName,description"}, 500)
-    return [{"team_id": t.get("id"), "name": t.get("displayName"),
-             "description": t.get("description")} for t in rows]
+    return [{k: v for k, v in {"team_id": t.get("id"), "name": t.get("displayName"),
+                                "description": t.get("description")}.items() if v} for t in rows]
+
+
+def list_teams_text(teams: list[dict]) -> str:
+    return "\n".join(
+        f"• {t.get('name')} · id {t.get('team_id')}"
+        + (f" · {fmt._shorten(t['description'], 80)}" if t.get("description") else "")
+        for t in teams) or "Not a member of any team."
 
 
 async def list_channels_data(team_id: str) -> list[dict]:
     tid = _team(team_id)
     rows, _ = await graph.get_all(
-        f"/teams/{tid}/channels",
-        {"$select": "id,displayName,description,membershipType,webUrl"}, 500)
-    return [{"channel_id": c.get("id"), "name": c.get("displayName"),
-             "description": c.get("description"), "membership": c.get("membershipType"),
-             "web_url": c.get("webUrl")} for c in rows]
+        f"/teams/{tid}/channels", {"$select": "id,displayName,description,membershipType"}, 500)
+    return [{k: v for k, v in {"channel_id": c.get("id"), "name": c.get("displayName"),
+                                "description": c.get("description"),
+                                "membership": c.get("membershipType")}.items() if v} for c in rows]
+
+
+def list_channels_text(channels: list[dict]) -> str:
+    return "\n".join(
+        f"• {c.get('name')}"
+        + (f" ({c['membership']})" if c.get("membership") not in (None, "standard") else "")
+        + f" · id {c.get('channel_id')}"
+        + (f" · {fmt._shorten(c['description'], 80)}" if c.get("description") else "")
+        for c in channels) or "No visible channels."
 
 
 async def list_team_members_data(team_id: str, limit: int) -> dict:
     tid = _team(team_id)
     rows, more = await graph.get_all(f"/teams/{tid}/members", None, _clamp(limit, 1, 1000))
-    out = {"count": len(rows), "members": [fmt.member(m) for m in rows]}
+    out: dict = {"count": len(rows), "members": [fmt.member(m) for m in rows]}
     if more:
-        out["note"] = "More members exist; raise limit."
+        out["note"] = "more members exist: raise limit"
     return out
+
+
+def members_text(d: dict) -> str:
+    return fmt.with_header(f"{d['count']} members", fmt.render_members(d["members"]), d.get("note"))
 
 
 async def read_channel_messages_data(team_id: str, channel_id: str, limit: int,
@@ -342,16 +517,21 @@ async def read_channel_messages_data(team_id: str, channel_id: str, limit: int,
         t = fmt.message(m, MAX_LIST_TEXT_CHARS)
         if include_replies:
             replies = sorted(m.get("replies") or [], key=lambda r: r.get("createdDateTime") or "")
-            t["reply_count"] = len(replies)
-            t["replies"] = [fmt.message(r, MAX_LIST_TEXT_CHARS) for r in replies[-20:]]
-            if len(replies) > 20:
-                t["replies_note"] = "Only the latest 20 replies shown; use get_channel_thread."
+            if replies:
+                t["reply_count"] = len(replies)
+                t["replies"] = [fmt.message(r, MAX_LIST_TEXT_CHARS) for r in replies[-20:]]
         threads.append(t)
-    out = {"team_id": tid, "channel_id": chid, "count": len(threads),
-           "order": "oldest first", "threads": threads}
+    out: dict = {"count": len(threads), "threads": threads}
     if more:
-        out["note"] = f"Showing the latest {limit} threads; older ones exist."
+        out["note"] = f"older posts exist beyond these {limit}"
     return out
+
+
+def threads_text(d: dict) -> str:
+    return fmt.with_header(
+        f"{d['count']} posts, oldest first (times UTC; reply to a post with its post id; "
+        f"get_channel_thread shows full text)",
+        fmt.render_threads(d["threads"]), d.get("note"))
 
 
 async def get_channel_thread_data(team_id: str, channel_id: str, message_id: str) -> dict:
@@ -362,18 +542,27 @@ async def get_channel_thread_data(team_id: str, channel_id: str, message_id: str
     root, (replies, more) = await asyncio.gather(
         graph.get(base), graph.get_all(f"{base}/replies", {"$top": 50}, 500))
     replies.sort(key=lambda r: r.get("createdDateTime") or "")
-    out = {"message": fmt.message(root), "reply_count": len(replies),
-           "replies": [fmt.message(r) for r in replies]}
+    post = fmt.message(root, full=True)
+    out: dict = {"post": post, "reply_count": len(replies),
+                 "replies": [fmt.message(r, full=True) for r in replies]}
     if more:
-        out["note"] = "Only the first 500 replies are shown."
+        out["note"] = "only the first 500 replies are shown"
     return out
+
+
+def thread_text(d: dict) -> str:
+    post = dict(d["post"], replies=d["replies"], reply_count=d["reply_count"])
+    body = fmt.render_threads([post])
+    if d["post"].get("web_url"):
+        body += f"\nOpen in Teams: {d['post']['web_url']}"
+    return fmt.with_header("Thread (times UTC)", body, d.get("note"))
 
 
 # ---------------------------------------------------------------- write functions
 async def _resolve_user(user: str) -> dict:
     u = (user or "").strip()
     if not (GUID_RE.match(u) or ("@" in u and " " not in u)):
-        raise ToolError("Give the person's email address or user_id (find_people returns both). "
+        raise ToolError("Give the person's email address (find_people returns it). "
                         "Names are not accepted, to avoid messaging the wrong person.")
     try:
         return await graph.get(f"/users/{quote(u, safe='@')}", {"$select": PERSON_FIELDS})
@@ -383,7 +572,11 @@ async def _resolve_user(user: str) -> dict:
         raise
 
 
-async def send_chat_message_data(chat_id: str, content: str, format: str, importance: str) -> dict:
+def _when(m: dict) -> str:
+    return f"{fmt.short_time(m.get('createdDateTime'))} UTC"
+
+
+async def send_chat_message_data(chat_id: str, content: str, format: str, importance: str) -> str:
     cid = _id(chat_id, "chat_id", "list_chats")
     payload: dict = {"body": _body(content, format)}
     if importance not in ("normal", "high", "urgent"):
@@ -391,10 +584,10 @@ async def send_chat_message_data(chat_id: str, content: str, format: str, import
     if importance != "normal":
         payload["importance"] = importance
     m = await graph.post(f"/chats/{cid}/messages", payload)
-    return _sent(m, chat_id=cid)
+    return f"Sent to chat {cid} at {_when(m)} (message id {m.get('id')})"
 
 
-async def send_direct_message_data(user: str, content: str, format: str) -> dict:
+async def send_direct_message_data(user: str, content: str, format: str) -> str:
     body = _body(content, format)
     target = await _resolve_user(user)
     me = await _me_id()
@@ -408,31 +601,33 @@ async def send_direct_message_data(user: str, content: str, format: str) -> dict
     # Returns the existing 1:1 chat if there already is one.
     c = await graph.post("/chats", {"chatType": "oneOnOne", "members": [member(me), member(target["id"])]})
     m = await graph.post(f"/chats/{c['id']}/messages", {"body": body})
-    return _sent(m, chat_id=c["id"], to=fmt.person(target))
+    p = fmt.person(target)
+    return (f"Sent to {p.get('name')} <{p.get('email', '?')}> at {_when(m)} "
+            f"(chat {c['id']}, message id {m.get('id')})")
 
 
 async def send_channel_message_data(team_id: str, channel_id: str, content: str,
-                                    format: str, subject: str) -> dict:
+                                    format: str, subject: str) -> str:
     tid = _team(team_id)
     chid = _id(channel_id, "channel_id", "list_channels")
     payload: dict = {"body": _body(content, format)}
     if subject.strip():
         payload["subject"] = subject.strip()[:255]
     m = await graph.post(f"/teams/{tid}/channels/{chid}/messages", payload)
-    return _sent(m, team_id=tid, channel_id=chid)
+    return f"Posted in channel {chid} at {_when(m)} (post id {m.get('id')})"
 
 
 async def reply_to_channel_message_data(team_id: str, channel_id: str, message_id: str,
-                                        content: str, format: str) -> dict:
+                                        content: str, format: str) -> str:
     tid = _team(team_id)
     chid = _id(channel_id, "channel_id", "list_channels")
     mid = _id(message_id, "message_id", "read_channel_messages")
     m = await graph.post(f"/teams/{tid}/channels/{chid}/messages/{mid}/replies",
                          {"body": _body(content, format)})
-    return _sent(m, team_id=tid, channel_id=chid, reply_to_id=mid)
+    return f"Replied to post {mid} at {_when(m)} (reply id {m.get('id')})"
 
 
-async def create_online_meeting_data(subject: str, start: str, end: str) -> dict:
+async def create_online_meeting_data(subject: str, start: str, end: str) -> str:
     try:
         start_dt = fmt.parse_time(start) if start.strip() else datetime.now(timezone.utc)
         end_dt = fmt.parse_time(end) if end.strip() else start_dt + timedelta(minutes=30)
@@ -445,104 +640,113 @@ async def create_online_meeting_data(subject: str, start: str, end: str) -> dict
         "startDateTime": fmt.iso_z(start_dt),
         "endDateTime": fmt.iso_z(end_dt),
     })
-    return {"meeting_id": m.get("id"), "subject": m.get("subject"),
-            "start": m.get("startDateTime"), "end": m.get("endDateTime"),
-            "join_url": m.get("joinWebUrl"),
-            "note": "This creates a Teams meeting link only; no calendar invitation is sent. "
-                    "Share join_url, for example with send_chat_message."}
+    return (f"Meeting created: {m.get('subject')}, {fmt.short_time(m.get('startDateTime'))} to "
+            f"{fmt.short_time(m.get('endDateTime'))} UTC\n"
+            f"Join link: {m.get('joinWebUrl')}\n"
+            f"No calendar invitation was sent: share the join link, e.g. with send_chat_message.")
 
 
 # ---------------------------------------------------------------- read tools
-@mcp.tool(annotations=READ_ONLY)
-async def whoami() -> dict:
+@mcp.tool(**READ)
+async def whoami(output: str = "text") -> str:
     """The Microsoft 365 account this server acts as, and the state of its sign-in."""
-    return await _call(whoami_data())
+    return await _run(whoami_data(), whoami_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def find_people(query: str, limit: int = 10) -> list[dict]:
-    """Look up people in the directory by name or email. Returns name, email,
-    user_id, job title and department. Use the email or user_id with
-    send_direct_message."""
-    return await _call(find_people_data(query, limit))
+@mcp.tool(**READ)
+async def find_people(query: str, limit: int = 10, output: str = "text") -> str:
+    """Look up people in the directory by name or email: name, email, job
+    title, department. Use the email with send_direct_message."""
+    return await _run(find_people_data(query, limit), fmt.render_people, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def list_chats(query: str = "", limit: int = 25) -> dict:
-    """The signed-in user's chats (1:1, group and meeting chats), most recently
-    active first, with chat_id, name, members, a preview of the last message and
-    an unread flag. With query, keeps only chats whose title or member names
-    contain it (case-insensitive)."""
-    return await _call(list_chats_data(query, limit))
+@mcp.tool(**READ)
+async def list_chats(query: str = "", limit: int = 25, since: str = "", max_members: int = 3,
+                     output: str = "text") -> str:
+    """The signed-in user's chats (1:1, group, meeting), most recently active
+    first: name, last message, UNREAD flag and chat id. limit is 1-100.
+    query keeps only chats whose title or member names contain it (case-insensitive).
+    since (ISO 8601, e.g. 2026-11-13T00:00:00Z) returns only chats with a message
+    at or after that time; the header says "cutoff reached" when that list is
+    complete, or "limit reached" when more may exist. max_members caps the member
+    names shown for titled group chats (0 = only a count)."""
+    return await _run(list_chats_data(query, limit, since, max_members), list_chats_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def get_chat(chat_id: str) -> dict:
-    """Details of one chat: type, topic, full member list with roles, and the
-    meeting join link for meeting chats."""
-    return await _call(get_chat_data(chat_id))
+@mcp.tool(**READ)
+async def get_chat(chat_id: str, output: str = "text") -> str:
+    """Details of one chat: full member list with emails and roles, meeting
+    join link for meeting chats, link to open it in Teams."""
+    return await _run(get_chat_data(chat_id), get_chat_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool(**READ)
 async def read_chat_messages(chat_id: str, limit: int = 30, since: str = "",
-                             include_system: bool = False) -> dict:
-    """Recent messages in a chat, returned oldest first. limit is 1-200.
-    since (ISO 8601, e.g. 2026-11-13T08:00:00Z) returns only messages created or
-    edited after that time. System events (members added, calls, renames) are
-    left out unless include_system is true. Long messages are cut; use
-    get_chat_message for the full text."""
-    return await _call(read_chat_messages_data(chat_id, limit, since, include_system))
+                             since_mode: str = "created", keep: str = "newest",
+                             include_system: bool = False, output: str = "text") -> str:
+    """Recent messages in a chat as a transcript, oldest first. limit is 1-200.
+    since (ISO 8601, e.g. 2026-11-13T08:00:00Z) returns messages created after
+    that time, plus older ones edited after it, marked "(edited <time>)".
+    since_mode="modified" also returns older messages that only got reactions.
+    When more messages match since than limit, keep="newest" (default) drops the
+    earliest ones and keep="oldest" drops the latest; the footer says how many.
+    System events are left out unless include_system. Long messages end with
+    [truncated] [id N]: get_chat_message gives the full text."""
+    return await _run(read_chat_messages_data(chat_id, limit, since, include_system, since_mode, keep),
+                      read_chat_messages_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def get_chat_message(chat_id: str, message_id: str) -> dict:
-    """One chat message in full: text, sender, attachments, mentions, reactions."""
-    return await _call(get_chat_message_data(chat_id, message_id))
+@mcp.tool(**READ)
+async def get_chat_message(chat_id: str, message_id: str, output: str = "text") -> str:
+    """One chat message in full, with attachment links."""
+    return await _run(get_chat_message_data(chat_id, message_id), full_message_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def search_messages(query: str, limit: int = 25) -> dict:
+@mcp.tool(**READ)
+async def search_messages(query: str, limit: int = 25, output: str = "text") -> str:
     """Full-text search across the signed-in user's chats and channel messages
-    (Microsoft Search, KQL syntax, e.g. 'budget from:alice'). Returns
-    snippets with chat_id or team_id/channel_id and message_id to read more."""
-    return await _call(search_messages_data(query, limit))
+    (Microsoft Search, KQL syntax, e.g. 'budget from:alice'). Each hit gives the
+    chat id, or team and channel ids, and the message id to read more."""
+    return await _run(search_messages_data(query, limit), search_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def list_teams() -> list[dict]:
-    """Teams the signed-in user is a member of, with team_id."""
-    return await _call(list_teams_data())
+@mcp.tool(**READ)
+async def list_teams(output: str = "text") -> str:
+    """Teams the signed-in user is a member of, with their ids."""
+    return await _run(list_teams_data(), list_teams_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def list_channels(team_id: str) -> list[dict]:
-    """Channels in a team that the signed-in user can see, with channel_id."""
-    return await _call(list_channels_data(team_id))
+@mcp.tool(**READ)
+async def list_channels(team_id: str, output: str = "text") -> str:
+    """Channels in a team that the signed-in user can see, with their ids."""
+    return await _run(list_channels_data(team_id), list_channels_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def list_team_members(team_id: str, limit: int = 200) -> dict:
-    """Members of a team with their roles (owner, member, guest)."""
-    return await _call(list_team_members_data(team_id, limit))
+@mcp.tool(**READ)
+async def list_team_members(team_id: str, limit: int = 200, output: str = "text") -> str:
+    """Members of a team with email and role (owner, guest)."""
+    return await _run(list_team_members_data(team_id, limit), members_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool(**READ)
 async def read_channel_messages(team_id: str, channel_id: str, limit: int = 20,
-                                include_replies: bool = True) -> dict:
-    """Recent top-level posts in a channel (limit 1-100), oldest first, each with
-    its latest replies when include_replies is true."""
-    return await _call(read_channel_messages_data(team_id, channel_id, limit, include_replies))
+                                include_replies: bool = True, output: str = "text") -> str:
+    """Recent posts in a channel (limit 1-100), oldest first, each with its
+    post id and, if include_replies, its latest 20 replies indented below."""
+    return await _run(read_channel_messages_data(team_id, channel_id, limit, include_replies),
+                      threads_text, output)
 
 
-@mcp.tool(annotations=READ_ONLY)
-async def get_channel_thread(team_id: str, channel_id: str, message_id: str) -> dict:
-    """One channel post and all its replies, in full."""
-    return await _call(get_channel_thread_data(team_id, channel_id, message_id))
+@mcp.tool(**READ)
+async def get_channel_thread(team_id: str, channel_id: str, message_id: str,
+                             output: str = "text") -> str:
+    """One channel post and all its replies, in full, with attachment links."""
+    return await _run(get_channel_thread_data(team_id, channel_id, message_id), thread_text, output)
 
 
 # ---------------------------------------------------------------- write tools
 async def send_chat_message(chat_id: str, content: str, format: str = "text",
-                            importance: str = "normal") -> dict:
+                            importance: str = "normal") -> str:
     """Send a message to an existing chat as the signed-in user. format 'text'
     sends the content as typed (line breaks kept); 'html' allows Teams HTML such
     as <b>, <i>, <a href>, <ul><li>, <br>. importance: normal, high or urgent.
@@ -550,28 +754,28 @@ async def send_chat_message(chat_id: str, content: str, format: str = "text",
     return await _call(send_chat_message_data(chat_id, content, format, importance))
 
 
-async def send_direct_message(user: str, content: str, format: str = "text") -> dict:
-    """Send a 1:1 message to a person by email address or user_id (from
-    find_people), creating the 1:1 chat if it doesn't exist yet. Confirm the
+async def send_direct_message(user: str, content: str, format: str = "text") -> str:
+    """Send a 1:1 message to a person by email address (from find_people) or
+    user id, creating the 1:1 chat if it doesn't exist yet. Confirm the
     recipient and wording with the user first."""
     return await _call(send_direct_message_data(user, content, format))
 
 
 async def send_channel_message(team_id: str, channel_id: str, content: str,
-                               format: str = "text", subject: str = "") -> dict:
+                               format: str = "text", subject: str = "") -> str:
     """Start a new post in a channel as the signed-in user, with an optional
     subject. Confirm the channel and wording with the user first."""
     return await _call(send_channel_message_data(team_id, channel_id, content, format, subject))
 
 
 async def reply_to_channel_message(team_id: str, channel_id: str, message_id: str,
-                                   content: str, format: str = "text") -> dict:
-    """Reply in the thread of a channel post as the signed-in user. Confirm the
-    wording with the user first."""
+                                   content: str, format: str = "text") -> str:
+    """Reply in the thread of a channel post (message_id = its post id) as the
+    signed-in user. Confirm the wording with the user first."""
     return await _call(reply_to_channel_message_data(team_id, channel_id, message_id, content, format))
 
 
-async def create_online_meeting(subject: str, start: str = "", end: str = "") -> dict:
+async def create_online_meeting(subject: str, start: str = "", end: str = "") -> str:
     """Create a Teams meeting and return its join link. start/end are ISO 8601
     with an offset (e.g. 2026-11-14T10:00:00+04:00); start defaults to now and
     end to start + 30 minutes. No calendar invitation is sent."""
@@ -581,7 +785,7 @@ async def create_online_meeting(subject: str, start: str = "", end: str = "") ->
 if ENABLE_WRITE:
     for _fn in (send_chat_message, send_direct_message, send_channel_message,
                 reply_to_channel_message, create_online_meeting):
-        mcp.tool(annotations=WRITES)(_fn)
+        mcp.tool(annotations=WRITES, output_schema=None)(_fn)
 
 
 # ---------------------------------------------------------------- http + auth

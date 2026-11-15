@@ -108,3 +108,33 @@ class GraphClient:
             url = page.get("@odata.nextLink")
             params = None  # the next link already carries the query
         return items[:limit], bool(url) or len(items) > limit
+
+    async def scan(self, path: str, params: dict | None = None, limit: int = 100, *,
+                   keep=None, stop=None, max_scan: int = 1000,
+                   headers: dict | None = None) -> tuple[list[dict], str]:
+        """Page through a collection in server order, keeping items that pass
+        `keep`, until one of these happens (the second value says which):
+          'stop'  - `stop(item)` was true (e.g. an ordered cutoff was passed);
+          'limit' - `limit` items were kept and at least one more would be kept;
+          'scan'  - `max_scan` items were examined (more may exist);
+          'end'   - the collection ran out.
+        After reaching `limit` it keeps reading (within `max_scan`) until it can tell
+        'limit' (more exist) from 'stop'/'end' (the list is complete)."""
+        kept: list[dict] = []
+        seen = 0
+        url: str | None = path
+        while url:
+            page = await self.request("GET", url, params=params, headers=headers)
+            params = None  # the next link already carries the query
+            for item in page.get("value") or []:
+                if stop and stop(item):
+                    return kept, "stop"
+                if keep is None or keep(item):
+                    if len(kept) >= limit:
+                        return kept, "limit"
+                    kept.append(item)
+                seen += 1
+                if seen >= max_scan:
+                    return kept, "scan"
+            url = page.get("@odata.nextLink")
+        return kept, "end"
